@@ -5,6 +5,8 @@
 using namespace facebook::cachelib;
 #if defined(USE_LRU) || defined(USE_STRICTLRU)
 using Cache = facebook::cachelib::LruAllocator;
+#elif defined(USE_LRUFORGIVE)
+using Cache = facebook::cachelib::LruForgiveAllocator;
 #elif defined(USE_CLOCK)
 using Cache = facebook::cachelib::ClockAllocator;
 #elif defined(USE_SIEVE)

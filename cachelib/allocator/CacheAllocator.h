@@ -2116,6 +2116,7 @@ namespace cachelib {
 // Declare templates ahead of use to reduce compilation time
 extern template class CacheAllocator<LruCacheTrait>;
 extern template class CacheAllocator<LruCacheWithSpinBucketsTrait>;
+extern template class CacheAllocator<LruForgiveCacheTrait>;
 extern template class CacheAllocator<Lru2QCacheTrait>;
 extern template class CacheAllocator<TinyLFUCacheTrait>;
 
@@ -2128,6 +2129,7 @@ extern template class CacheAllocator<S3FIFOCacheTrait>;
 // LRU policy can be configured to act as a segmented LRU as well
 using LruAllocator = CacheAllocator<LruCacheTrait>;
 using LruAllocatorSpinBuckets = CacheAllocator<LruCacheWithSpinBucketsTrait>;
+using LruForgiveAllocator = CacheAllocator<LruForgiveCacheTrait>;
 
 // CacheAllocator with 2Q eviction policy
 // Hot, Warm, Cold queues are maintained
