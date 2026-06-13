@@ -29,3 +29,5 @@ build/
 build2/
 _build2/
 result/
+cachelib/external/zstd/
+mybench/*.oracleGeneral.bin
