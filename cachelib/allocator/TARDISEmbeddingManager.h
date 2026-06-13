@@ -17,6 +17,8 @@
 #include <random>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
+#include <shared_mutex>
 
 namespace facebook {
 namespace cachelib {
@@ -55,6 +57,9 @@ class TARDISEmbeddingManager {
   // current context, advances the context periodically, and tracks the object
   // in the recent-access buffer.
   void on_access(uint64_t obj_id) {
+    // Thread lock
+    // std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     // Batched context update every 10 accesses (variance-preserving)
     if (++perturb_counter_ >= 10) {
       perturb_counter_ = 0;
@@ -93,6 +98,9 @@ class TARDISEmbeddingManager {
   // Returns the average of the top-k cosine similarities between this object's
   // embedding and the embeddings of objects in the recent-access buffer.
   double avg_top_k_similarity_to_recent(uint64_t obj_id, int top_k = 3) {
+    // Thread lock
+    // std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = embeddings_.find(obj_id);
     if (it == embeddings_.end()) return 0.0;
 
@@ -122,15 +130,26 @@ class TARDISEmbeddingManager {
   }
 
   int get_access_count(uint64_t obj_id) const {
+    // Thread lock
+    // std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = access_count_.find(obj_id);
     return (it != access_count_.end()) ? it->second : 0;
   }
 
   bool has_embedding(uint64_t obj_id) const {
+    // Thread lock
+    // std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return embeddings_.count(obj_id) > 0;
   }
 
-  size_t get_num_embeddings() const { return embeddings_.size(); }
+  size_t get_num_embeddings() const {
+    // Thread lock
+    // std::lock_guard<std::mutex> lock(mutex_);
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return embeddings_.size();
+  }
 
  private:
   // LRU list management for the embedding cache (capped mode only)
@@ -225,6 +244,12 @@ class TARDISEmbeddingManager {
     if (denom < 1e-10) return 0.0;
     return dot / denom;
   }
+
+  // Lock everything mutex
+  // mutable std::mutex mutex_;
+
+  // Shared Mutex
+  mutable std::shared_mutex mutex_;
 
   // Parameters
   double lr_;
