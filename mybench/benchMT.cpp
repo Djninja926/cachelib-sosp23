@@ -53,7 +53,6 @@ static void trace_replay_run_thread(struct bench_data *bdata,
                                     bench_opts_t *opts, int thread_id,
                                     struct thread_res *res) {
   pin_thread_to_core(thread_id - 1);
-  // pthread_setname_np(pthread_self(), "trace_replay_" + to_string(thread_id));
 
   struct request *req = new_request();
   struct reader *reader =
@@ -72,15 +71,31 @@ static void trace_replay_run_thread(struct bench_data *bdata,
   }
 
   LOG(INFO) << "thread " << thread_id << " start";
+
+  const bool shared = (opts->mode == 1);
+  const uint64_t my_id = static_cast<uint64_t>(thread_id - 1);
+  const uint64_t nthr = static_cast<uint64_t>(opts->n_thread);
+  uint64_t record_idx = 0;
+
   while (read_trace(reader, req) == 0) {
-    if (res->n_get % 1000 == 0 && thread_id == 1) {
-        util::setCurrentTimeSec(req->timestamp);
+    // Round-robin shared mode: only process records assigned to this thread.
+    if (shared && (record_idx++ % nthr) != my_id) {
+      continue;
+    }
+
+    // if (res->n_get % 1000 == 0 && thread_id == 1) {
+    //   util::setCurrentTimeSec(req->timestamp);
+    // }
+    if (res->n_get % 1000 == 0) {
+      util::setCurrentTimeSec(req->timestamp);
     }
     status = cache_go(bdata->cache, bdata->pool, req, &res->n_get, &res->n_set,
                       &res->n_del, &res->n_get_miss);
 
     if (res->n_get % 1000000 == 0) {
-      if (STOP_FLAG.load()) {
+      // In replicated mode, stop when any thread signals completion.
+      // In shared mode, run to completion (each thread owns a disjoint share).
+      if (!shared && STOP_FLAG.load()) {
         break;
       }
       res->trace_time = req->timestamp;

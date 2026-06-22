@@ -43,8 +43,12 @@ static bench_opts_t parse_cmd(int argc, char *argv[]) {
   bench_opts_t opts = create_default_bench_opts();
 
   if (argc < 3) {
+    // printf(
+    //     "usage: %s trace_path cache_size_in_MB [hashpower] [n_thread]\n",
+    //     argv[0]);
     printf(
-        "usage: %s trace_path cache_size_in_MB [hashpower] [n_thread]\n",
+        "usage: %s trace_path cache_size_in_MB [hashpower] [n_thread] [mode]\n"
+        "  mode: 0=replicated replay (default), 1=round-robin shared\n",
         argv[0]);
     exit(1);
   }
@@ -56,6 +60,9 @@ static bench_opts_t parse_cmd(int argc, char *argv[]) {
   }
   if (argc >= 5) {
     opts.n_thread = atoi(argv[4]);
+  }
+  if (argc >= 6) {
+    opts.mode = atoi(argv[5]);
   }
 
   return opts;

@@ -29,6 +29,7 @@ typedef struct {
   int n_thread;
 
   int hashpower;
+  int mode;
 
   char trace_path[MAX_TRACE_PATH_LEN];
   enum trace_type trace_type;
@@ -38,6 +39,7 @@ static inline bench_opts_t create_default_bench_opts() {
   bench_opts_t opts;
   opts.cache_size_in_mb = 200;
   opts.hashpower = 26;
+  opts.mode = 0;
   opts.n_thread = 1;
   opts.report_interval = 86400;
   opts.trace_type = oracleGeneral;

@@ -31,3 +31,4 @@ _build2/
 result/
 cachelib/external/zstd/
 mybench/*.oracleGeneral.bin
+mybench/*.oracleGeneral.bin
