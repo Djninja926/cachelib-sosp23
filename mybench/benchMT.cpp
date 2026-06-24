@@ -18,6 +18,9 @@
 #include "bench.h"
 #include "reader.h"
 #include "request.h"
+#if defined(USE_LRUFORGIVE)
+#include "cachelib/allocator/TARDISEmbeddingManager.h"
+#endif
 
 using namespace std;
 
@@ -78,10 +81,18 @@ static void trace_replay_run_thread(struct bench_data *bdata,
   uint64_t record_idx = 0;
 
   while (read_trace(reader, req) == 0) {
+    // record_idx is the global trace position of this record (both modes).
+    const uint64_t this_seq = record_idx++;
     // Round-robin shared mode: only process records assigned to this thread.
     if (shared && (record_idx++ % nthr) != my_id) {
       continue;
     }
+
+    // Tag this access with its true trace position for the log-structured
+    // embedding manager (used as the applier's ordering key).
+    #if defined(USE_LRUFORGIVE)
+    TARDISEmbeddingManager::set_trace_seq(this_seq);
+    #endif
 
     // if (res->n_get % 1000 == 0 && thread_id == 1) {
     //   util::setCurrentTimeSec(req->timestamp);
