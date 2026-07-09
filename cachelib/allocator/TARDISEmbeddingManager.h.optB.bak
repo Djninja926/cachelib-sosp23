@@ -1,21 +1,20 @@
 /*
- * TARDIS Embedding Manager for CacheLib - Log-Structured (Option B + Stage 1 batching)
+ * TARDIS Embedding Manager for CacheLib - Log-Structured (Option B)
+ * Ported from Aryan Khatri's LRUForgiveEmbCacheEmbeddingManager (libCacheSim)
  *
- * Same as Option B (per-thread SPSC buffers + single applier doing an N-way
- * merge by seq), with one throughput change: the applier accumulates a
- * seq-ordered BATCH of up to kBatchSize events and applies the whole batch
- * under a SINGLE state-lock acquisition (applyBatch), instead of locking once
- * per event. This cuts lock acquire/release overhead by ~kBatchSize and keeps
- * the embedding state hot in cache across the batch.
+ * Log-structured lazy update design:
+ *   - Hot path (on_access): appends an AccessEvent to the calling thread's own
+ *     single-producer-single-consumer ring buffer. No lock, no embedding math.
+ *   - Background applier thread: drains all per-thread buffers in sequence order
+ *     (N-way merge by seq) and performs the actual embedding/context/recency
+ *     updates. Single writer, so no lock is needed on the embedding state.
+ *   - Read methods (eviction-time forgiveness): single-writer/multi-reader,
+ *     protected by a low-traffic shared_mutex. NOT on the hot path.
  *
- * Semantics are identical to Option B: events are still applied in seq order,
- * with the same per-event logic. The only behavioral difference is that a
- * low-seq event arriving while a batch is mid-apply is deferred to the next
- * batch, giving a cross-batch reorder distance of ~kBatchSize (kept small so
- * miss ratio matches; the Option A window sweep showed 256 matches B exactly).
- *
- * Tradeoff: larger kBatchSize = fewer lock acquisitions (faster applier) but
- * longer eviction-reader stalls (the applier holds the write lock per batch).
+ * v1: free-running applier, strict in-order application (apply global-min seq
+ * next). Seq is a global atomic counter (enqueue order, not true trace order);
+ * sufficient because strict application serializes all updates through one
+ * total order. True trace-order seq is a later refinement if needed.
  */
 
 #pragma once
@@ -45,17 +44,17 @@ class TARDISEmbeddingManager {
 
   using EmbeddingArray = std::array<std::array<double, D>, K>;
 
+  // A single logged access event. 16 bytes.
   struct AccessEvent {
     uint64_t obj_id;
     uint64_t seq;
   };
 
+  // Max worker threads we support. Each gets its own SPSC buffer.
   static constexpr int kMaxThreads = 64;
+  // Per-thread ring buffer capacity. Generously sized so the free-running
+  // applier rarely causes a producer to spin. ~16 bytes * 1M = 16MB/thread.
   static constexpr size_t kQueueCapacity = 1u << 20;
-  // Number of events applied per lock acquisition. Tradeoff: throughput (more)
-  // vs eviction-reader stall + cross-batch reorder distance (less). 256 matched
-  // Option B miss ratio exactly in the window sweep.
-  static constexpr size_t kBatchSize = 256;
 
   TARDISEmbeddingManager(double lr,
                          double ctx_speed,
@@ -74,15 +73,21 @@ class TARDISEmbeddingManager {
     recent_ids_.resize(recent_window_);
     recent_valid_.resize(recent_window_, false);
 
+    // Allocate per-thread SPSC buffers up front.
     for (int i = 0; i < kMaxThreads; i++) {
       buffers_[i] =
           std::make_unique<folly::ProducerConsumerQueue<AccessEvent>>(
               kQueueCapacity);
+      buf_active_[i].store(false, std::memory_order_relaxed);
+      buf_head_seq_[i] = kNoSeq;
     }
+
+    // Start the background applier.
     applier_ = std::thread(&TARDISEmbeddingManager::applierLoop, this);
   }
 
   ~TARDISEmbeddingManager() {
+    // Signal shutdown and let the applier drain whatever remains.
     stop_.store(true, std::memory_order_release);
     if (applier_.joinable()) {
       applier_.join();
@@ -93,9 +98,20 @@ class TARDISEmbeddingManager {
   TARDISEmbeddingManager& operator=(const TARDISEmbeddingManager&) = delete;
 
   // ---- HOT PATH ----
+  // Append the access to this thread's own buffer. No lock, no math.
+  // void on_access(uint64_t obj_id) {
+  //   const int tid = threadSlot();
+  //   const uint64_t seq = seq_counter_.fetch_add(1, std::memory_order_relaxed);
+  //   AccessEvent ev{obj_id, seq};
+  //   // SPSC write. If the buffer is full (applier fell behind), spin briefly.
+  //   // With kQueueCapacity sized generously this is rare.
+  //   while (!buffers_[tid]->write(ev)) {
+  //     std::this_thread::yield();
+  //   }
+  // }
   void on_access(uint64_t obj_id) {
     const int tid = threadSlot();
-    AccessEvent ev{obj_id, current_trace_seq};
+    AccessEvent ev{obj_id, current_trace_seq};   // true trace order, not atomic counter
     while (!buffers_[tid]->write(ev)) {
       std::this_thread::yield();
     }
@@ -109,9 +125,11 @@ class TARDISEmbeddingManager {
 
     std::vector<double> sims;
     sims.reserve(recent_count_);
+
     for (int i = 0; i < recent_count_; i++) {
       if (recent_ids_[i] == obj_id) continue;
       if (!recent_valid_[i]) continue;
+
       const auto& emb = it->second;
       const auto& recent_emb = recent_embeddings_[i];
       double sum = 0.0;
@@ -120,7 +138,9 @@ class TARDISEmbeddingManager {
       }
       sims.push_back(sum / K);
     }
+
     if (sims.empty()) return 0.0;
+
     std::sort(sims.begin(), sims.end(), std::greater<double>());
     int count = std::min(top_k, static_cast<int>(sims.size()));
     double total = 0.0;
@@ -149,21 +169,29 @@ class TARDISEmbeddingManager {
  private:
   static constexpr uint64_t kNoSeq = ~0ull;
 
+  // Assign each calling thread a stable slot index in [0, kMaxThreads).
   static int threadSlot() {
     thread_local int slot = -1;
     if (slot < 0) {
       slot = next_slot_.fetch_add(1, std::memory_order_relaxed);
+      // If we exceed kMaxThreads, wrap (collision: two threads share a buffer,
+      // which is still correct because the applier reads by seq, just with a
+      // small ordering imperfection). Should not happen in our sweeps (<=16).
       slot %= kMaxThreads;
     }
+    // Mark the slot active so the applier knows to drain it.
     return slot;
   }
 
-  // ---- BACKGROUND APPLIER (batched) ----
+  // ---- BACKGROUND APPLIER ----
+  // Strict in-order N-way merge: repeatedly find the buffer whose head has the
+  // global-minimum seq and apply it. Free-running; drains remaining events on
+  // shutdown.
   void applierLoop() {
+    // Local cache of each buffer's current head event (peeked but not yet
+    // applied). buf_head_seq_[i] == kNoSeq means "no pending head for i".
     std::vector<AccessEvent> head(kMaxThreads);
     std::vector<bool> haveHead(kMaxThreads, false);
-    std::vector<AccessEvent> batch;
-    batch.reserve(kBatchSize);
 
     auto refillHead = [&](int i) {
       if (haveHead[i]) return;
@@ -175,55 +203,54 @@ class TARDISEmbeddingManager {
     };
 
     while (true) {
-      // Top up all heads, then build a seq-ordered batch by repeated global-min.
+      // Try to refill any missing heads.
       for (int i = 0; i < kMaxThreads; i++) refillHead(i);
 
-      batch.clear();
-      while (batch.size() < kBatchSize) {
-        int minIdx = -1;
-        uint64_t minSeq = kNoSeq;
-        for (int i = 0; i < kMaxThreads; i++) {
-          if (haveHead[i] && head[i].seq < minSeq) {
-            minSeq = head[i].seq;
-            minIdx = i;
+      // Find the buffer with the global-minimum seq among available heads.
+      int minIdx = -1;
+      uint64_t minSeq = kNoSeq;
+      for (int i = 0; i < kMaxThreads; i++) {
+        if (haveHead[i] && head[i].seq < minSeq) {
+          minSeq = head[i].seq;
+          minIdx = i;
+        }
+      }
+
+      if (minIdx < 0) {
+        // Nothing available right now.
+        if (stop_.load(std::memory_order_acquire)) {
+          // One more sweep to catch late arrivals, then exit if still empty.
+          bool any = false;
+          for (int i = 0; i < kMaxThreads; i++) {
+            refillHead(i);
+            if (haveHead[i]) any = true;
           }
+          if (!any) break;
+          continue;
         }
-        if (minIdx < 0) break;  // nothing available right now
-        batch.push_back(head[minIdx]);
-        haveHead[minIdx] = false;
-        refillHead(minIdx);  // refill only the consumed buffer
-      }
-
-      if (!batch.empty()) {
-        applyBatch(batch);
+        std::this_thread::yield();
         continue;
       }
 
-      // Batch empty: nothing available.
-      if (stop_.load(std::memory_order_acquire)) {
-        bool any = false;
-        for (int i = 0; i < kMaxThreads; i++) {
-          refillHead(i);
-          if (haveHead[i]) any = true;
-        }
-        if (!any) break;
-        continue;
-      }
-      std::this_thread::yield();
+      // STRICT ORDERING NOTE: ideally we would wait until every still-active
+      // producer has a head before committing to the global min, to guarantee
+      // we never apply seq=k+1 before a not-yet-arrived seq=k. In v1 we apply
+      // the min across currently-available heads. Because each producer's own
+      // events are monotonic in seq and we always take the global min of what's
+      // present, the only reordering possible is when a slow producer's lower
+      // seq has not yet landed. We accept that small window in v1 and measure;
+      // tightening it (barrier on all active producers) is the strict-vs-
+      // approximate experiment.
+      applyEvent(head[minIdx]);
+      haveHead[minIdx] = false;
     }
   }
 
-  // Apply a whole batch under ONE lock acquisition. Events are pre-sorted by
-  // seq by the caller, so this preserves seq-order application.
-  void applyBatch(const std::vector<AccessEvent>& batch) {
+  // Apply a single access event to the embedding state. Mirrors the original
+  // single-threaded on_access logic exactly. Holds the state mutex so eviction
+  // readers see consistent data.
+  void applyEvent(const AccessEvent& ev) {
     std::unique_lock<std::shared_mutex> lock(state_mutex_);
-    for (const auto& ev : batch) {
-      applyEventLocked(ev);
-    }
-  }
-
-  // Per-event logic, identical to single-threaded on_access. Caller holds lock.
-  void applyEventLocked(const AccessEvent& ev) {
     const uint64_t obj_id = ev.obj_id;
 
     if (++perturb_counter_ >= 10) {
@@ -283,6 +310,7 @@ class TARDISEmbeddingManager {
     for (int k = 0; k < K; k++)
       for (int d = 0; d < D; d++) context_[k][d] = normal_dist_(rng_);
   }
+
   void update_context_batch() {
     double effective_speed = 10.0 * ctx_speed_;
     double decay = std::sqrt(1.0 - effective_speed);
@@ -292,11 +320,13 @@ class TARDISEmbeddingManager {
         context_[k][d] =
             decay * context_[k][d] + noise_scale * normal_dist_(rng_);
   }
+
   void init_embedding(uint64_t obj_id) {
     auto& emb = embeddings_[obj_id];
     for (int k = 0; k < K; k++)
       for (int d = 0; d < D; d++) emb[k][d] = normal_dist_(rng_);
   }
+
   void update_embedding(uint64_t obj_id) {
     auto& emb = embeddings_[obj_id];
     double decay = std::sqrt(1.0 - lr_);
@@ -305,6 +335,7 @@ class TARDISEmbeddingManager {
       for (int d = 0; d < D; d++)
         emb[k][d] = decay * emb[k][d] + ctx_scale * context_[k][d];
   }
+
   void update_recent(uint64_t obj_id) {
     recent_ids_[recent_idx_] = obj_id;
     auto it = embeddings_.find(obj_id);
@@ -317,6 +348,7 @@ class TARDISEmbeddingManager {
     recent_idx_ = (recent_idx_ + 1) % recent_window_;
     if (recent_count_ < recent_window_) recent_count_++;
   }
+
   static double cosine_similarity(const double* a, const double* b) {
     double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
     for (int i = 0; i < D; i++) {
@@ -336,7 +368,7 @@ class TARDISEmbeddingManager {
   int min_access_count_;
   int64_t max_entries_;
 
-  // ---- embedding state (applier-owned; read under mutex) ----
+  // ---- embedding state (owned exclusively by the applier; read under mutex) ----
   mutable std::shared_mutex state_mutex_;
   double context_[K][D];
   std::unordered_map<uint64_t, EmbeddingArray> embeddings_;
@@ -355,6 +387,9 @@ class TARDISEmbeddingManager {
   // ---- log infrastructure ----
   std::unique_ptr<folly::ProducerConsumerQueue<AccessEvent>>
       buffers_[kMaxThreads];
+  std::atomic<bool> buf_active_[kMaxThreads];
+  uint64_t buf_head_seq_[kMaxThreads];
+  std::atomic<uint64_t> seq_counter_{0};
   std::thread applier_;
   std::atomic<bool> stop_{false};
 
@@ -362,6 +397,7 @@ class TARDISEmbeddingManager {
   static thread_local uint64_t current_trace_seq;
 };
 
+// Definition of the static thread-slot allocator.
 inline std::atomic<int> TARDISEmbeddingManager::next_slot_{0};
 inline thread_local uint64_t TARDISEmbeddingManager::current_trace_seq = 0;
 
