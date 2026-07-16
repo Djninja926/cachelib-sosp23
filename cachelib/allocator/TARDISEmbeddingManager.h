@@ -62,12 +62,14 @@ class TARDISEmbeddingManager {
                          int recent_window,
                          int min_access_count,
                          int64_t max_entries = -1,
-                         uint64_t seed = 42)
+                         uint64_t seed = 42,
+                         int embed_threshold = -1)
       : lr_(lr),
         ctx_speed_(ctx_speed),
         recent_window_(recent_window),
         min_access_count_(min_access_count),
         max_entries_(max_entries),
+        embed_threshold_(embed_threshold < 0 ? min_access_count : embed_threshold),
         rng_(seed) {
     init_context();
     recent_embeddings_.resize(recent_window_);
@@ -243,7 +245,7 @@ class TARDISEmbeddingManager {
         move_to_front(obj_id);
       }
       update_recent(obj_id);
-    } else if (count == min_access_count_) {
+    } else if (count == embed_threshold_) {
       if (max_entries_ >= 0) {
         while (static_cast<int64_t>(embeddings_.size()) >= max_entries_ &&
                !lru_list_.empty()) {
@@ -334,6 +336,7 @@ class TARDISEmbeddingManager {
   double ctx_speed_;
   int recent_window_;
   int min_access_count_;
+  int embed_threshold_;
   int64_t max_entries_;
 
   // ---- embedding state (applier-owned; read under mutex) ----
