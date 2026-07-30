@@ -40,9 +40,7 @@ MMLruForgive::Container<T, HookPtr>::Container(serialization::MMLruObject object
       config_.contextSpeed,
       config_.recentWindow,
       config_.minAccessCount,
-      config_.maxEmbeddingEntries,
-      /* seed */ 42,
-      config_.embedThreshold);
+      config_.maxEmbeddingEntries);
 }
 
 template <typename T, MMLruForgive::Hook<T> T::*HookPtr>

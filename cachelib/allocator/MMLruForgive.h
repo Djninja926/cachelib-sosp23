@@ -168,10 +168,6 @@ class MMLruForgive {
     // Minimum number of accesses before an object gets an embedding. Filters
     // out one-hit-wonders from the embedding store.
     int minAccessCount{2};
-    // Stage A: accesses required before an object earns an embedding.
-    // Decoupled from minAccessCount so admission and forgiveness thresholds
-    // move independently. Default 2 = current behavior (embed at 2nd access).
-    int embedThreshold{2};
 
     // Cosine similarity threshold above which an eviction candidate is forgiven
     // (promoted to MRU instead of being evicted).

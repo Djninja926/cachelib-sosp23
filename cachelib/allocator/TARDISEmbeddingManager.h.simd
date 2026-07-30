@@ -5,36 +5,17 @@
  * merge by seq), with one throughput change: the applier accumulates a
  * seq-ordered BATCH of up to kBatchSize events and applies the whole batch
  * under a SINGLE state-lock acquisition (applyBatch), instead of locking once
- * per event.
+ * per event. This cuts lock acquire/release overhead by ~kBatchSize and keeps
+ * the embedding state hot in cache across the batch.
  *
- * ---------------------------------------------------------------------------
- * PHASE 1b: recency-reorder isolation (env-gated, off by default)
+ * Semantics are identical to Option B: events are still applied in seq order,
+ * with the same per-event logic. The only behavioral difference is that a
+ * low-seq event arriving while a batch is mid-apply is deferred to the next
+ * batch, giving a cross-batch reorder distance of ~kBatchSize (kept small so
+ * miss ratio matches; the Option A window sweep showed 256 matches B exactly).
  *
- * Phase 1a (hard-barrier windowing) was a dead end: in a single applier, reorder
- * and applier-staleness are coupled, so a barrier that enforces order induces
- * head-of-line staleness that destroyed the gap at t>1 even at W=1. Only
- * parallel appliers decouple them.
- *
- * Phase 1b isolates the ONE thing sharding actually approximates, the recency
- * buffer's write order, with zero barrier and zero staleness confound. Because
- * applyBatch holds the write lock for the whole batch and eviction reads take
- * the shared lock, no read observes the ring mid-batch, so we can:
- *   1. apply every event in seq order exactly as baseline (embeddings, context,
- *      counts byte-faithful), capturing each recency write's (obj_id, embedding
- *      snapshot) at its true seq position instead of writing it inline;
- *   2. flush the captured recency writes into the ring at batch end, in shard
- *      order (bucketed by hash(obj_id) % K).
- * Between batches the ring holds the same writes as baseline, only reordered, so
- * there is no new staleness. K=1 reproduces baseline byte-for-byte.
- *
- * Knobs:
- *   TARDIS_RECENCY_SHARDS=K (default 1 = OFF = inline baseline). K>1 simulates
- *     K parallel appliers sharing the recency ring.
- *   TARDIS_RECENCY_MODE=0 (default) = interleave (round-robin across buckets;
- *     realistic, reorder ~K). =1 = group (concatenate buckets; pessimistic,
- *     reorder ~batch).
- * Reorder is capped at the batch size (kBatchSize); a realistic skew bound.
- * ---------------------------------------------------------------------------
+ * Tradeoff: larger kBatchSize = fewer lock acquisitions (faster applier) but
+ * longer eviction-reader stalls (the applier holds the write lock per batch).
  */
 
 #pragma once
@@ -44,7 +25,6 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <list>
 #include <memory>
 #include <random>
@@ -75,13 +55,6 @@ class TARDISEmbeddingManager {
     uint64_t seq;
   };
 
-  // ---- Phase 1b recency-intent record ----
-  struct RecencyIntent {
-    uint64_t obj_id;
-    EmbeddingData emb;
-    bool valid;
-  };
-
   static constexpr int kMaxThreads = 64;
   static constexpr size_t kQueueCapacity = 1u << 20;
   static constexpr size_t kBatchSize = 256;
@@ -102,15 +75,6 @@ class TARDISEmbeddingManager {
     recent_embeddings_.resize(recent_window_);
     recent_ids_.resize(recent_window_);
     recent_valid_.resize(recent_window_, false);
-
-    // Phase 1b recency-reorder knobs (read BEFORE the applier thread spawns).
-    if (const char* s = std::getenv("TARDIS_RECENCY_SHARDS")) {
-      recency_shards_ = std::atoi(s);
-      if (recency_shards_ < 1) recency_shards_ = 1;
-    }
-    if (const char* m = std::getenv("TARDIS_RECENCY_MODE")) {
-      recency_mode_ = std::atoi(m);
-    }
 
     for (int i = 0; i < kMaxThreads; i++) {
       buffers_[i] =
@@ -215,13 +179,6 @@ class TARDISEmbeddingManager {
     return slot;
   }
 
-  static inline uint64_t hashObj(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdull;
-    x ^= x >> 33;
-    return x;
-  }
-
   // ---- BACKGROUND APPLIER (batched) ----
   void applierLoop() {
     std::vector<AccessEvent> head(kMaxThreads);
@@ -277,11 +234,9 @@ class TARDISEmbeddingManager {
 
   void applyBatch(const std::vector<AccessEvent>& batch) {
     std::unique_lock<std::shared_mutex> lock(state_mutex_);
-    if (recency_shards_ > 1) recency_intents_.clear();
     for (const auto& ev : batch) {
       applyEventLocked(ev);
     }
-    if (recency_shards_ > 1) flushRecencyReordered();
   }
 
   void applyEventLocked(const AccessEvent& ev) {
@@ -303,7 +258,7 @@ class TARDISEmbeddingManager {
       if (max_entries_ >= 0) {
         move_to_front(obj_id);
       }
-      record_recent(obj_id);
+      update_recent(obj_id);
     } else if (count == min_access_count_) {
       if (max_entries_ >= 0) {
         while (static_cast<int64_t>(embeddings_.size()) >= max_entries_ &&
@@ -315,66 +270,7 @@ class TARDISEmbeddingManager {
       } else {
         init_embedding(obj_id);
       }
-      record_recent(obj_id);
-    }
-  }
-
-  // Recency sink: inline (baseline) when not sharding, else capture the write
-  // (obj_id + embedding snapshot at THIS seq position) for a reordered flush.
-  void record_recent(uint64_t obj_id) {
-    if (recency_shards_ <= 1) {
-      update_recent(obj_id);   // baseline, byte-identical
-      return;
-    }
-    RecencyIntent in;
-    in.obj_id = obj_id;
-    auto it = embeddings_.find(obj_id);
-    if (it != embeddings_.end()) {
-      in.emb = it->second;
-      in.valid = true;
-    } else {
-      in.valid = false;
-    }
-    recency_intents_.push_back(std::move(in));
-  }
-
-  void writeRecent(const RecencyIntent& in) {
-    recent_ids_[recent_idx_] = in.obj_id;
-    if (in.valid) {
-      recent_embeddings_[recent_idx_] = in.emb;
-      recent_valid_[recent_idx_] = true;
-    } else {
-      recent_valid_[recent_idx_] = false;
-    }
-    recent_idx_ = (recent_idx_ + 1) % recent_window_;
-    if (recent_count_ < recent_window_) recent_count_++;
-  }
-
-  // Flush captured recency writes into the ring in shard order. Buckets by
-  // hash(obj_id) % K, preserving in-shard (seq) order; interleave or group.
-  void flushRecencyReordered() {
-    const int Ks = recency_shards_;
-    if (recency_buckets_.size() != static_cast<size_t>(Ks)) {
-      recency_buckets_.assign(Ks, {});
-    } else {
-      for (auto& b : recency_buckets_) b.clear();
-    }
-    for (auto& in : recency_intents_) {
-      recency_buckets_[hashObj(in.obj_id) % Ks].push_back(std::move(in));
-    }
-
-    if (recency_mode_ == 1) {
-      // GROUP (pessimistic): concatenate shards, reorder ~batch.
-      for (int s = 0; s < Ks; s++)
-        for (auto& in : recency_buckets_[s]) writeRecent(in);
-    } else {
-      // INTERLEAVE (realistic): round-robin across shards, reorder ~K.
-      size_t maxLen = 0;
-      for (int s = 0; s < Ks; s++)
-        maxLen = std::max(maxLen, recency_buckets_[s].size());
-      for (size_t r = 0; r < maxLen; r++)
-        for (int s = 0; s < Ks; s++)
-          if (r < recency_buckets_[s].size()) writeRecent(recency_buckets_[s][r]);
+      update_recent(obj_id);
     }
   }
 
@@ -472,8 +368,6 @@ class TARDISEmbeddingManager {
   int recent_window_;
   int min_access_count_;
   int64_t max_entries_;
-  int recency_shards_ = 1;   // TARDIS_RECENCY_SHARDS: 1 = OFF (inline baseline)
-  int recency_mode_ = 0;     // TARDIS_RECENCY_MODE: 0 = interleave, 1 = group
 
   // ---- embedding state (applier-owned; read under mutex) ----
   mutable std::shared_mutex state_mutex_;
@@ -490,10 +384,6 @@ class TARDISEmbeddingManager {
   std::normal_distribution<double> normal_dist_{0.0, 1.0};
   std::list<uint64_t> lru_list_;
   std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map_;
-
-  // Phase 1b scratch (applier-owned; touched only under the write lock)
-  std::vector<RecencyIntent> recency_intents_;
-  std::vector<std::vector<RecencyIntent>> recency_buckets_;
 
   // ---- log infrastructure ----
   std::unique_ptr<folly::ProducerConsumerQueue<AccessEvent>>
