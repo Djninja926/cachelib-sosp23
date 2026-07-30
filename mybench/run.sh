@@ -30,14 +30,14 @@ for nThread in 1 2 4 8 16; do
     echo "############## ${algo} ${nThread} threads, cache size $sz MB, hashpower $hp"
     numactl --membind=0 ./_build/${algo} zipf1.0_1_100.oracleGeneral.bin $sz $hp ${nThread} | tail -n 1
 
-    echo "############## lru ${nThread} threads, cache size $sz MB, hashpower $hp"
-    numactl --cpunodebind=0 --membind=0 ./_build/lru /mydata/tardis/traces/cache-t-00.oracleGeneral $sz $hp ${nThread} | tail -n 1
+    # echo "############## lru ${nThread} threads, cache size $sz MB, hashpower $hp"
+    # numactl --cpunodebind=0 --membind=0 ./_build/lru /mydata/tardis/traces/cache-t-00.oracleGeneral $sz $hp ${nThread} | tail -n 1
 
-    echo "############## s3fifo ${nThread} threads, cache size $sz MB, hashpower $hp"
-    numactl --cpunodebind=0 --membind=0 ./_build/s3fifo /mydata/tardis/traces/cache-t-00.oracleGeneral $sz $hp ${nThread} | tail -n 1
+    # echo "############## s3fifo ${nThread} threads, cache size $sz MB, hashpower $hp"
+    # numactl --cpunodebind=0 --membind=0 ./_build/s3fifo /mydata/tardis/traces/cache-t-00.oracleGeneral $sz $hp ${nThread} | tail -n 1
 
-    echo "############## lruforgive ${nThread} threads, cache size $sz MB, hashpower $hp"
-    numactl --cpunodebind=0 --membind=0 ./_build/lruforgive  /mydata/tardis/traces/msr_proj_0.oracleGeneral $sz $hp ${nThread} 1 | tail -n 1
+    # echo "############## lruforgive ${nThread} threads, cache size $sz MB, hashpower $hp"
+    # numactl --cpunodebind=0 --membind=0 ./_build/lruforgive  /mydata/tardis/traces/msr_proj_0.oracleGeneral $sz $hp ${nThread} 1 | tail -n 1
     echo -e "thread results ${nThread} | tail -n 1"
 done
 
