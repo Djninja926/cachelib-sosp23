@@ -1,40 +1,21 @@
 /*
  * TARDIS Embedding Manager for CacheLib - Log-Structured (Option B + Stage 1 batching)
  *
- * Same as Option B (per-thread SPSC buffers + single applier doing an N-way
- * merge by seq), with one throughput change: the applier accumulates a
- * seq-ordered BATCH of up to kBatchSize events and applies the whole batch
- * under a SINGLE state-lock acquisition (applyBatch), instead of locking once
- * per event.
+ * Per-thread SPSC buffers + a single background applier doing an N-way merge by
+ * seq, applying seq-ordered batches of up to kBatchSize under one state-lock
+ * acquisition. Includes the SIMD read-path optimizations (norms cached in
+ * EmbeddingData, single-pass bounded top-3, cosine taking precomputed norms).
  *
- * ---------------------------------------------------------------------------
- * PHASE 1b: recency-reorder isolation (env-gated, off by default)
- *
- * Phase 1a (hard-barrier windowing) was a dead end: in a single applier, reorder
- * and applier-staleness are coupled, so a barrier that enforces order induces
- * head-of-line staleness that destroyed the gap at t>1 even at W=1. Only
- * parallel appliers decouple them.
- *
- * Phase 1b isolates the ONE thing sharding actually approximates, the recency
- * buffer's write order, with zero barrier and zero staleness confound. Because
- * applyBatch holds the write lock for the whole batch and eviction reads take
- * the shared lock, no read observes the ring mid-batch, so we can:
- *   1. apply every event in seq order exactly as baseline (embeddings, context,
- *      counts byte-faithful), capturing each recency write's (obj_id, embedding
- *      snapshot) at its true seq position instead of writing it inline;
- *   2. flush the captured recency writes into the ring at batch end, in shard
- *      order (bucketed by hash(obj_id) % K).
- * Between batches the ring holds the same writes as baseline, only reordered, so
- * there is no new staleness. K=1 reproduces baseline byte-for-byte.
- *
- * Knobs:
- *   TARDIS_RECENCY_SHARDS=K (default 1 = OFF = inline baseline). K>1 simulates
- *     K parallel appliers sharing the recency ring.
- *   TARDIS_RECENCY_MODE=0 (default) = interleave (round-robin across buckets;
- *     realistic, reorder ~K). =1 = group (concatenate buckets; pessimistic,
- *     reorder ~batch).
- * Reorder is capped at the batch size (kBatchSize); a realistic skew bound.
- * ---------------------------------------------------------------------------
+ * WAIT STRATEGY (adaptive backoff): bare yield() busy-waits burned ~84% of
+ * syscall time on sched_yield (producer/consumer rate imbalance turning into a
+ * yield storm). Both idle sites now use idle_backoff: a cheap spin first (no
+ * syscall, absorbs short bursts), then a few yields, then a short sleep once
+ * genuinely idle. This roughly doubled throughput with zero fidelity change
+ * (it touches only how idle threads wait, never what is applied). A blocking
+ * condition-variable variant was tried and lost: at high thread counts no
+ * thread is deeply idle, so CV signaling became a futex storm; brief spinning
+ * wins in this tight rate-matched regime. It adds no threads, the only lever
+ * that helps on this (40-core, pool-heavy) box.
  */
 
 #pragma once
@@ -42,11 +23,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <shared_mutex>
 #include <thread>
@@ -75,13 +57,6 @@ class TARDISEmbeddingManager {
     uint64_t seq;
   };
 
-  // ---- Phase 1b recency-intent record ----
-  struct RecencyIntent {
-    uint64_t obj_id;
-    EmbeddingData emb;
-    bool valid;
-  };
-
   static constexpr int kMaxThreads = 64;
   static constexpr size_t kQueueCapacity = 1u << 20;
   static constexpr size_t kBatchSize = 256;
@@ -102,15 +77,6 @@ class TARDISEmbeddingManager {
     recent_embeddings_.resize(recent_window_);
     recent_ids_.resize(recent_window_);
     recent_valid_.resize(recent_window_, false);
-
-    // Phase 1b recency-reorder knobs (read BEFORE the applier thread spawns).
-    if (const char* s = std::getenv("TARDIS_RECENCY_SHARDS")) {
-      recency_shards_ = std::atoi(s);
-      if (recency_shards_ < 1) recency_shards_ = 1;
-    }
-    if (const char* m = std::getenv("TARDIS_RECENCY_MODE")) {
-      recency_mode_ = std::atoi(m);
-    }
 
     for (int i = 0; i < kMaxThreads; i++) {
       buffers_[i] =
@@ -134,8 +100,9 @@ class TARDISEmbeddingManager {
   void on_access(uint64_t obj_id) {
     const int tid = threadSlot();
     AccessEvent ev{obj_id, current_trace_seq};
+    uint32_t idle = 0;
     while (!buffers_[tid]->write(ev)) {
-      std::this_thread::yield();
+      idle_backoff(idle++);
     }
   }
 
@@ -215,11 +182,20 @@ class TARDISEmbeddingManager {
     return slot;
   }
 
-  static inline uint64_t hashObj(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdull;
-    x ^= x >> 33;
-    return x;
+  // Adaptive idle backoff: cheap spins first (no syscall, absorbs short
+  // bursts), then a few yields, then a short sleep once genuinely idle. Tuned
+  // to reach the sleep tier soon after the burst window so the residual
+  // sched_yield is small, while keeping the cheap-spin tier that makes this
+  // fast. `n` is the caller's consecutive-idle count (reset to 0 on progress).
+  static inline void idle_backoff(uint32_t n) {
+    if (n < 64) {
+      for (volatile int i = 0; i < 32; i++) {
+      }
+    } else if (n < 512) {
+      std::this_thread::yield();
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
   }
 
   // ---- BACKGROUND APPLIER (batched) ----
@@ -228,6 +204,7 @@ class TARDISEmbeddingManager {
     std::vector<bool> haveHead(kMaxThreads, false);
     std::vector<AccessEvent> batch;
     batch.reserve(kBatchSize);
+    uint32_t idle = 0;
 
     auto refillHead = [&](int i) {
       if (haveHead[i]) return;
@@ -258,6 +235,7 @@ class TARDISEmbeddingManager {
       }
 
       if (!batch.empty()) {
+        idle = 0;
         applyBatch(batch);
         continue;
       }
@@ -271,17 +249,15 @@ class TARDISEmbeddingManager {
         if (!any) break;
         continue;
       }
-      std::this_thread::yield();
+      idle_backoff(idle++);
     }
   }
 
   void applyBatch(const std::vector<AccessEvent>& batch) {
     std::unique_lock<std::shared_mutex> lock(state_mutex_);
-    if (recency_shards_ > 1) recency_intents_.clear();
     for (const auto& ev : batch) {
       applyEventLocked(ev);
     }
-    if (recency_shards_ > 1) flushRecencyReordered();
   }
 
   void applyEventLocked(const AccessEvent& ev) {
@@ -303,7 +279,7 @@ class TARDISEmbeddingManager {
       if (max_entries_ >= 0) {
         move_to_front(obj_id);
       }
-      record_recent(obj_id);
+      update_recent(obj_id);
     } else if (count == min_access_count_) {
       if (max_entries_ >= 0) {
         while (static_cast<int64_t>(embeddings_.size()) >= max_entries_ &&
@@ -315,66 +291,7 @@ class TARDISEmbeddingManager {
       } else {
         init_embedding(obj_id);
       }
-      record_recent(obj_id);
-    }
-  }
-
-  // Recency sink: inline (baseline) when not sharding, else capture the write
-  // (obj_id + embedding snapshot at THIS seq position) for a reordered flush.
-  void record_recent(uint64_t obj_id) {
-    if (recency_shards_ <= 1) {
-      update_recent(obj_id);   // baseline, byte-identical
-      return;
-    }
-    RecencyIntent in;
-    in.obj_id = obj_id;
-    auto it = embeddings_.find(obj_id);
-    if (it != embeddings_.end()) {
-      in.emb = it->second;
-      in.valid = true;
-    } else {
-      in.valid = false;
-    }
-    recency_intents_.push_back(std::move(in));
-  }
-
-  void writeRecent(const RecencyIntent& in) {
-    recent_ids_[recent_idx_] = in.obj_id;
-    if (in.valid) {
-      recent_embeddings_[recent_idx_] = in.emb;
-      recent_valid_[recent_idx_] = true;
-    } else {
-      recent_valid_[recent_idx_] = false;
-    }
-    recent_idx_ = (recent_idx_ + 1) % recent_window_;
-    if (recent_count_ < recent_window_) recent_count_++;
-  }
-
-  // Flush captured recency writes into the ring in shard order. Buckets by
-  // hash(obj_id) % K, preserving in-shard (seq) order; interleave or group.
-  void flushRecencyReordered() {
-    const int Ks = recency_shards_;
-    if (recency_buckets_.size() != static_cast<size_t>(Ks)) {
-      recency_buckets_.assign(Ks, {});
-    } else {
-      for (auto& b : recency_buckets_) b.clear();
-    }
-    for (auto& in : recency_intents_) {
-      recency_buckets_[hashObj(in.obj_id) % Ks].push_back(std::move(in));
-    }
-
-    if (recency_mode_ == 1) {
-      // GROUP (pessimistic): concatenate shards, reorder ~batch.
-      for (int s = 0; s < Ks; s++)
-        for (auto& in : recency_buckets_[s]) writeRecent(in);
-    } else {
-      // INTERLEAVE (realistic): round-robin across shards, reorder ~K.
-      size_t maxLen = 0;
-      for (int s = 0; s < Ks; s++)
-        maxLen = std::max(maxLen, recency_buckets_[s].size());
-      for (size_t r = 0; r < maxLen; r++)
-        for (int s = 0; s < Ks; s++)
-          if (r < recency_buckets_[s].size()) writeRecent(recency_buckets_[s][r]);
+      update_recent(obj_id);
     }
   }
 
@@ -472,8 +389,6 @@ class TARDISEmbeddingManager {
   int recent_window_;
   int min_access_count_;
   int64_t max_entries_;
-  int recency_shards_ = 1;   // TARDIS_RECENCY_SHARDS: 1 = OFF (inline baseline)
-  int recency_mode_ = 0;     // TARDIS_RECENCY_MODE: 0 = interleave, 1 = group
 
   // ---- embedding state (applier-owned; read under mutex) ----
   mutable std::shared_mutex state_mutex_;
@@ -490,10 +405,6 @@ class TARDISEmbeddingManager {
   std::normal_distribution<double> normal_dist_{0.0, 1.0};
   std::list<uint64_t> lru_list_;
   std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map_;
-
-  // Phase 1b scratch (applier-owned; touched only under the write lock)
-  std::vector<RecencyIntent> recency_intents_;
-  std::vector<std::vector<RecencyIntent>> recency_buckets_;
 
   // ---- log infrastructure ----
   std::unique_ptr<folly::ProducerConsumerQueue<AccessEvent>>
