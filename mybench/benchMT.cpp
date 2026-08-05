@@ -18,6 +18,9 @@
 #include "bench.h"
 #include "reader.h"
 #include "request.h"
+#if defined(USE_LRUFORGIVE)
+#include "cachelib/allocator/TARDISEmbeddingManager.h"
+#endif
 
 using namespace std;
 

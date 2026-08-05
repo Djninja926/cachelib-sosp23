@@ -36,7 +36,11 @@ target_link_libraries(strictlru cachelib fmt::fmt atomic)
 
 add_executable(lru main.cpp reader.cpp bench.cpp benchMT.cpp cache.cpp)
 target_compile_definitions(lru PRIVATE USE_LRU)
-target_link_libraries(lru cachelib fmt::fmt atomic) 
+target_link_libraries(lru cachelib fmt::fmt atomic)
+
+add_executable(lruforgive main.cpp reader.cpp bench.cpp benchMT.cpp cache.cpp)
+target_compile_definitions(lruforgive PRIVATE USE_LRUFORGIVE)
+target_link_libraries(lruforgive cachelib fmt::fmt atomic)
 
 add_executable(twoq main.cpp reader.cpp bench.cpp benchMT.cpp cache.cpp)
 target_compile_definitions(twoq PRIVATE USE_TWOQ)

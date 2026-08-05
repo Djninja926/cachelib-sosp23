@@ -17,6 +17,7 @@
 #include "cachelib/allocator/ChainedHashTable.h"
 #include "cachelib/allocator/MM2Q.h"
 #include "cachelib/allocator/MMLru.h"
+#include "cachelib/allocator/MMLruForgive.h"
 #include "cachelib/allocator/MMTinyLFU.h"
 #include "cachelib/allocator/MMClock.h"
 #include "cachelib/allocator/MMSieve.h"
@@ -34,6 +35,8 @@ const int MMClock::kId = 4;
 const int MMSieve::kId = 6;
 // const int MMSieveBuffered::kId = 7;
 const int MMS3FIFO::kId = 5;
+const int MMLruForgive::kId = 8;
+// const int MMS3FIFOForgive::kId = 9;
 
 // AccessType
 const int ChainedHashTable::kId = 1;

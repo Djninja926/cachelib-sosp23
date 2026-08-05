@@ -13,6 +13,14 @@ algo=${1:-"s3fifo"}
 sz_base=${2:-"4000"}
 hp_base=${3:-"21"}
 
+# Ensure turbo boost is disabled (you tried, but add check)
+if [ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+    current=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo "unknown")
+    if [ "$current" != "1" ]; then
+        echo "Warning: Turbo boost may still be enabled (value=$current)"
+    fi
+fi
+
 
 for nThread in 1 2 4 8 16; do 
     sz=$(echo "${sz_base} * ${nThread}" | bc)

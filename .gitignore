@@ -29,3 +29,4 @@ build/
 build2/
 _build2/
 result/
+mybench/*.oracleGeneral.bin

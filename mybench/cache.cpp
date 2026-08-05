@@ -52,9 +52,28 @@ void mycache_init(int64_t cache_size_in_mb, unsigned int hashpower,
 
   // print_config(config);
   *cache_p = new Cache(config);
-#ifdef USE_STRICTLRU
+
+#if defined(USE_STRICTLRU)
   Cache::MMConfig mm_config;
   mm_config.lruRefreshTime = 0;
+  *pool_p = (*cache_p)->addPool("default",
+                                (*cache_p)->getCacheMemoryStats().ramCacheSize,
+                                {}, mm_config);
+#elif defined(USE_LRUFORGIVE)
+  Cache::MMConfig mm_config;
+  // MCACHE mode: bound the embedding store at 5x estimated cache item count.
+  // Average object size 34KB is the TARDIS paper Table 5 number for the
+  // Wikipedia text CDN workload. Adjust constant if running other workloads.
+  constexpr int64_t kAvgObjSize = 34000;
+  int64_t est_cache_items =
+      (cache_size_in_mb * 1024LL * 1024LL) / kAvgObjSize;
+  mm_config.maxEmbeddingEntries = 5 * est_cache_items;
+  fprintf(stderr,
+          "[LRUFORGIVE] cache_mb=%ld, est_cache_items=%ld, "
+          "maxEmbeddingEntries=%ld (MCACHE 5x)\n",
+          (long)cache_size_in_mb,
+          (long)est_cache_items,
+          (long)mm_config.maxEmbeddingEntries);
   *pool_p = (*cache_p)->addPool("default",
                                 (*cache_p)->getCacheMemoryStats().ramCacheSize,
                                 {}, mm_config);
