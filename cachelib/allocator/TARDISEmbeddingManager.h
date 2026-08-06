@@ -61,6 +61,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <pthread.h>
+#include <sched.h>
+
 #include <folly/ProducerConsumerQueue.h>
 
 namespace facebook {
@@ -147,6 +150,14 @@ class TARDISEmbeddingManager {
     if (const char* m = std::getenv("TARDIS_RECENCY_MODE")) {
       recency_mode_ = std::atoi(m);
     }
+    // Core to pin the applier thread to, so it doesn't float onto a core
+    // mybench has pinned a worker to (or migrate cross-NUMA away from the
+    // shard state, which follows the process's numactl --membind policy).
+    // Worker pinning (mybench/benchMT.cpp) only ever uses even cores, so
+    // core 1 is never claimed by a worker; -1 disables pinning.
+    if (const char* c = std::getenv("TARDIS_APPLIER_CORE")) {
+      applier_core_ = std::atoi(c);
+    }
 
     for (int i = 0; i < kMaxThreads; i++) {
       buffers_[i] =
@@ -154,6 +165,13 @@ class TARDISEmbeddingManager {
               kQueueCapacity);
     }
     applier_ = std::thread(&TARDISEmbeddingManager::applierLoop, this);
+    if (applier_core_ >= 0) {
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(applier_core_, &cpuset);
+      pthread_setaffinity_np(applier_.native_handle(), sizeof(cpu_set_t),
+                              &cpuset);
+    }
   }
 
   ~TARDISEmbeddingManager() {
@@ -527,6 +545,7 @@ class TARDISEmbeddingManager {
   int64_t max_entries_;
   int recency_shards_ = 1;   // TARDIS_RECENCY_SHARDS: 1 = OFF (inline baseline)
   int recency_mode_ = 0;     // TARDIS_RECENCY_MODE: 0 = interleave, 1 = group
+  int applier_core_ = 1;     // TARDIS_APPLIER_CORE: CPU to pin applier to (-1 = off)
 
   // ---- embedding state, sharded per origin thread; read/written under
   // state_mutex_ (applier is the sole writer; reads scan for the owning
