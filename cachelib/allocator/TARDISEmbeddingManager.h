@@ -83,7 +83,6 @@ class TARDISEmbeddingManager {
 
   struct AccessEvent {
     uint64_t obj_id;
-    uint64_t seq;
     int shard;
   };
 
@@ -188,7 +187,7 @@ class TARDISEmbeddingManager {
   // `shard` is the object's owning shard, decoded by the caller from the key
   void on_access(uint64_t obj_id, int shard) {
     const int tid = threadSlot();
-    AccessEvent ev{obj_id, current_trace_seq, shard};
+    AccessEvent ev{obj_id, shard};
     while (!buffers_[tid]->write(ev)) {
       std::this_thread::yield();
     }
@@ -261,11 +260,7 @@ class TARDISEmbeddingManager {
     return total;
   }
 
-  static void set_trace_seq(uint64_t s) { current_trace_seq = s; }
-
  private:
-  static constexpr uint64_t kNoSeq = ~0ull;
-
   static int threadSlot() {
     thread_local int slot = -1;
     if (slot < 0) {
@@ -283,39 +278,26 @@ class TARDISEmbeddingManager {
   }
 
   // ---- BACKGROUND APPLIER (batched) ----
+  // Each buffers_[i] is a single-producer/single-consumer queue, so draining
+  // it in order already preserves that origin thread's chronological order.
+  // No shard depends on another shard's state, so no cross-thread
+  // interleaving order needs to be reconstructed here either.
   void applierLoop() {
-    std::vector<AccessEvent> head(kMaxThreads);
-    std::vector<bool> haveHead(kMaxThreads, false);
     std::vector<AccessEvent> batch;
     batch.reserve(kBatchSize);
 
-    auto refillHead = [&](int i) {
-      if (haveHead[i]) return;
+    auto drainOnce = [&]() {
+      batch.clear();
       AccessEvent ev;
-      if (buffers_[i]->read(ev)) {
-        head[i] = ev;
-        haveHead[i] = true;
+      for (int i = 0; i < kMaxThreads && batch.size() < kBatchSize; i++) {
+        while (batch.size() < kBatchSize && buffers_[i]->read(ev)) {
+          batch.push_back(ev);
+        }
       }
     };
 
     while (true) {
-      for (int i = 0; i < kMaxThreads; i++) refillHead(i);
-
-      batch.clear();
-      while (batch.size() < kBatchSize) {
-        int minIdx = -1;
-        uint64_t minSeq = kNoSeq;
-        for (int i = 0; i < kMaxThreads; i++) {
-          if (haveHead[i] && head[i].seq < minSeq) {
-            minSeq = head[i].seq;
-            minIdx = i;
-          }
-        }
-        if (minIdx < 0) break;
-        batch.push_back(head[minIdx]);
-        haveHead[minIdx] = false;
-        refillHead(minIdx);
-      }
+      drainOnce();
 
       if (!batch.empty()) {
         applyBatch(batch);
@@ -323,12 +305,9 @@ class TARDISEmbeddingManager {
       }
 
       if (stop_.load(std::memory_order_acquire)) {
-        bool any = false;
-        for (int i = 0; i < kMaxThreads; i++) {
-          refillHead(i);
-          if (haveHead[i]) any = true;
-        }
-        if (!any) break;
+        drainOnce();
+        if (batch.empty()) break;
+        applyBatch(batch);
         continue;
       }
       std::this_thread::yield();
@@ -564,11 +543,9 @@ class TARDISEmbeddingManager {
   std::atomic<bool> stop_{false};
 
   static std::atomic<int> next_slot_;
-  static thread_local uint64_t current_trace_seq;
 };
 
 inline std::atomic<int> TARDISEmbeddingManager::next_slot_{0};
-inline thread_local uint64_t TARDISEmbeddingManager::current_trace_seq = 0;
 
 }  // namespace cachelib
 }  // namespace facebook
