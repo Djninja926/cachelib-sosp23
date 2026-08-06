@@ -186,9 +186,8 @@ class TARDISEmbeddingManager {
   // ---- HOT PATH ----
   // `shard` is the object's owning shard, decoded by the caller from the key
   void on_access(uint64_t obj_id, int shard) {
-    const int tid = threadSlot();
     AccessEvent ev{obj_id, shard};
-    while (!buffers_[tid]->write(ev)) {
+    while (!buffers_[shard]->write(ev)) {
       std::this_thread::yield();
     }
   }
@@ -261,15 +260,6 @@ class TARDISEmbeddingManager {
   }
 
  private:
-  static int threadSlot() {
-    thread_local int slot = -1;
-    if (slot < 0) {
-      slot = next_slot_.fetch_add(1, std::memory_order_relaxed);
-      slot %= kMaxThreads;
-    }
-    return slot;
-  }
-
   static inline uint64_t hashObj(uint64_t x) {
     x ^= x >> 33;
     x *= 0xff51afd7ed558ccdull;
@@ -541,11 +531,7 @@ class TARDISEmbeddingManager {
       buffers_[kMaxThreads];
   std::thread applier_;
   std::atomic<bool> stop_{false};
-
-  static std::atomic<int> next_slot_;
 };
-
-inline std::atomic<int> TARDISEmbeddingManager::next_slot_{0};
 
 }  // namespace cachelib
 }  // namespace facebook
