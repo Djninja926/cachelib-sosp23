@@ -35,6 +35,14 @@
  *     reorder ~batch).
  * Reorder is capped at the batch size (kBatchSize); a realistic skew bound.
  * ---------------------------------------------------------------------------
+ *
+ * ---------------------------------------------------------------------------
+ * Thread-local redesign
+ *
+ * Every mybench worker thread owns a disjoint key space, so each shard is 
+ * logically written on behalf of exactly one origin thread.
+ 
+ * ---------------------------------------------------------------------------
  */
 
 #pragma once
@@ -73,6 +81,7 @@ class TARDISEmbeddingManager {
   struct AccessEvent {
     uint64_t obj_id;
     uint64_t seq;
+    int shard;
   };
 
   // ---- Phase 1b recency-intent record ----
@@ -86,6 +95,30 @@ class TARDISEmbeddingManager {
   static constexpr size_t kQueueCapacity = 1u << 20;
   static constexpr size_t kBatchSize = 256;
 
+  // Per-origin-thread embedding state. Written only by the applier thread,
+  // but always on behalf of exactly one origin shard (see AccessEvent::shard),
+  // so each ShardState is logically single-writer.
+  struct ShardState {
+    double context[K][D];
+    std::unordered_map<uint64_t, EmbeddingData> embeddings;
+    std::unordered_map<uint64_t, int> access_count;
+    std::vector<EmbeddingData> recent_embeddings;
+    std::vector<uint64_t> recent_ids;
+    std::vector<bool> recent_valid;
+    int recent_idx = 0;
+    int recent_count = 0;
+    int perturb_counter = 0;
+    std::mt19937 rng;
+
+    // ---- embedding-cache LRU (capped/MCACHE mode) ----
+    std::list<uint64_t> lru_list;
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map;
+
+    std::vector<RecencyIntent> recency_intents;
+    std::vector<std::vector<RecencyIntent>> recency_buckets;
+    bool recencyTouchedThisBatch = false;
+  };
+
   TARDISEmbeddingManager(double lr,
                          double ctx_speed,
                          int recent_window,
@@ -96,12 +129,15 @@ class TARDISEmbeddingManager {
         ctx_speed_(ctx_speed),
         recent_window_(recent_window),
         min_access_count_(min_access_count),
-        max_entries_(max_entries),
-        rng_(seed) {
-    init_context();
-    recent_embeddings_.resize(recent_window_);
-    recent_ids_.resize(recent_window_);
-    recent_valid_.resize(recent_window_, false);
+        max_entries_(max_entries) {
+    for (int i = 0; i < kMaxThreads; i++) {
+      auto& s = shards_[i];
+      s.rng.seed(seed + static_cast<uint64_t>(i));
+      init_context(s);
+      s.recent_embeddings.resize(recent_window_);
+      s.recent_ids.resize(recent_window_);
+      s.recent_valid.resize(recent_window_, false);
+    }
 
     // Phase 1b recency-reorder knobs (read BEFORE the applier thread spawns).
     if (const char* s = std::getenv("TARDIS_RECENCY_SHARDS")) {
@@ -131,36 +167,39 @@ class TARDISEmbeddingManager {
   TARDISEmbeddingManager& operator=(const TARDISEmbeddingManager&) = delete;
 
   // ---- HOT PATH ----
-  void on_access(uint64_t obj_id) {
+  // `shard` is the object's owning shard, decoded by the caller from the key
+  void on_access(uint64_t obj_id, int shard) {
     const int tid = threadSlot();
-    AccessEvent ev{obj_id, current_trace_seq};
+    AccessEvent ev{obj_id, current_trace_seq, shard};
     while (!buffers_[tid]->write(ev)) {
       std::this_thread::yield();
     }
   }
 
   // ---- READ PATH (eviction-time forgiveness) ----
-  double avg_top_k_similarity_to_recent(uint64_t obj_id, int top_k = 3) {
+  // `shard` is the candidate's owning shard
+  double avg_top_k_similarity_to_recent(uint64_t obj_id, int shard, int top_k = 3) {
     std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    auto it = embeddings_.find(obj_id);
-    if (it == embeddings_.end()) return 0.0;
+    const auto& s = shards_[shard];
+    auto it = s.embeddings.find(obj_id);
+    if (it == s.embeddings.end()) return 0.0;
 
-    // OPTIMIZATION 2: Bounded top-k in a single pass. 
+    // OPTIMIZATION 2: Bounded top-k in a single pass.
     // Removes std::vector allocation and std::sort. Caps top_k at 3.
     double top[3] = {-2.0, -2.0, -2.0}; // Cosine similarity is >= -1.0
     int valid_count = 0;
     const auto& cand = it->second;
 
-    for (int i = 0; i < recent_count_; i++) {
-      if (recent_ids_[i] == obj_id) continue;
-      if (!recent_valid_[i]) continue;
-      
-      const auto& recent_emb = recent_embeddings_[i];
+    for (int i = 0; i < s.recent_count; i++) {
+      if (s.recent_ids[i] == obj_id) continue;
+      if (!s.recent_valid[i]) continue;
+
+      const auto& recent_emb = s.recent_embeddings[i];
       double sum = 0.0;
       for (int k = 0; k < K; k++) {
-        sum += cosine_similarity(cand.vectors[k].data(), 
-                                 recent_emb.vectors[k].data(), 
-                                 cand.norms[k], 
+        sum += cosine_similarity(cand.vectors[k].data(),
+                                 recent_emb.vectors[k].data(),
+                                 cand.norms[k],
                                  recent_emb.norms[k]);
       }
       double avg_sim = sum / K;
@@ -177,28 +216,31 @@ class TARDISEmbeddingManager {
     }
 
     if (valid_count == 0) return 0.0;
-    
+
     // Safety cap incase a user passes top_k > 3, we cap at the array bounds
-    int count = std::min(top_k, std::min(3, valid_count)); 
+    int count = std::min(top_k, std::min(3, valid_count));
     double total = 0.0;
     for (int i = 0; i < count; i++) total += top[i];
     return total / count;
   }
 
-  int get_access_count(uint64_t obj_id) const {
+  int get_access_count(uint64_t obj_id, int shard) const {
     std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    auto it = access_count_.find(obj_id);
-    return (it != access_count_.end()) ? it->second : 0;
+    const auto& s = shards_[shard];
+    auto it = s.access_count.find(obj_id);
+    return it != s.access_count.end() ? it->second : 0;
   }
 
-  bool has_embedding(uint64_t obj_id) const {
+  bool has_embedding(uint64_t obj_id, int shard) const {
     std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    return embeddings_.count(obj_id) > 0;
+    return shards_[shard].embeddings.count(obj_id) > 0;
   }
 
   size_t get_num_embeddings() const {
     std::shared_lock<std::shared_mutex> lock(state_mutex_);
-    return embeddings_.size();
+    size_t total = 0;
+    for (const auto& s : shards_) total += s.embeddings.size();
+    return total;
   }
 
   static void set_trace_seq(uint64_t s) { current_trace_seq = s; }
@@ -251,10 +293,10 @@ class TARDISEmbeddingManager {
             minIdx = i;
           }
         }
-        if (minIdx < 0) break;  
+        if (minIdx < 0) break;
         batch.push_back(head[minIdx]);
         haveHead[minIdx] = false;
-        refillHead(minIdx);  
+        refillHead(minIdx);
       }
 
       if (!batch.empty()) {
@@ -277,166 +319,177 @@ class TARDISEmbeddingManager {
 
   void applyBatch(const std::vector<AccessEvent>& batch) {
     std::unique_lock<std::shared_mutex> lock(state_mutex_);
-    if (recency_shards_ > 1) recency_intents_.clear();
+    if (recency_shards_ > 1) touchedShards_.clear();
     for (const auto& ev : batch) {
-      applyEventLocked(ev);
+      ShardState& s = shards_[ev.shard];
+      if (recency_shards_ > 1 && !s.recencyTouchedThisBatch) {
+        s.recency_intents.clear();
+        s.recencyTouchedThisBatch = true;
+        touchedShards_.push_back(ev.shard);
+      }
+      applyEventLocked(s, ev);
     }
-    if (recency_shards_ > 1) flushRecencyReordered();
+    if (recency_shards_ > 1) {
+      for (int idx : touchedShards_) {
+        flushRecencyReordered(shards_[idx]);
+        shards_[idx].recencyTouchedThisBatch = false;
+      }
+    }
   }
 
-  void applyEventLocked(const AccessEvent& ev) {
+  void applyEventLocked(ShardState& s, const AccessEvent& ev) {
     const uint64_t obj_id = ev.obj_id;
 
-    if (++perturb_counter_ >= 10) {
-      perturb_counter_ = 0;
-      update_context_batch();
+    if (++s.perturb_counter >= 10) {
+      s.perturb_counter = 0;
+      update_context_batch(s);
     }
 
-    int& count = access_count_[obj_id];
+    int& count = s.access_count[obj_id];
     count++;
 
-    auto it = embeddings_.find(obj_id);
-    bool has_emb = (it != embeddings_.end());
+    auto it = s.embeddings.find(obj_id);
+    bool has_emb = (it != s.embeddings.end());
 
     if (has_emb) {
-      update_embedding(obj_id);
+      update_embedding(s, obj_id);
       if (max_entries_ >= 0) {
-        move_to_front(obj_id);
+        move_to_front(s, obj_id);
       }
-      record_recent(obj_id);
+      record_recent(s, obj_id);
     } else if (count == min_access_count_) {
       if (max_entries_ >= 0) {
-        while (static_cast<int64_t>(embeddings_.size()) >= max_entries_ &&
-               !lru_list_.empty()) {
-          evict_lru();
+        while (static_cast<int64_t>(s.embeddings.size()) >= max_entries_ &&
+               !s.lru_list.empty()) {
+          evict_lru(s);
         }
-        init_embedding(obj_id);
-        add_to_lru(obj_id);
+        init_embedding(s, obj_id);
+        add_to_lru(s, obj_id);
       } else {
-        init_embedding(obj_id);
+        init_embedding(s, obj_id);
       }
-      record_recent(obj_id);
+      record_recent(s, obj_id);
     }
   }
 
   // Recency sink: inline (baseline) when not sharding, else capture the write
   // (obj_id + embedding snapshot at THIS seq position) for a reordered flush.
-  void record_recent(uint64_t obj_id) {
+  void record_recent(ShardState& s, uint64_t obj_id) {
     if (recency_shards_ <= 1) {
-      update_recent(obj_id);   // baseline, byte-identical
+      update_recent(s, obj_id);   // baseline, byte-identical
       return;
     }
     RecencyIntent in;
     in.obj_id = obj_id;
-    auto it = embeddings_.find(obj_id);
-    if (it != embeddings_.end()) {
+    auto it = s.embeddings.find(obj_id);
+    if (it != s.embeddings.end()) {
       in.emb = it->second;
       in.valid = true;
     } else {
       in.valid = false;
     }
-    recency_intents_.push_back(std::move(in));
+    s.recency_intents.push_back(std::move(in));
   }
 
-  void writeRecent(const RecencyIntent& in) {
-    recent_ids_[recent_idx_] = in.obj_id;
+  void writeRecent(ShardState& s, const RecencyIntent& in) {
+    s.recent_ids[s.recent_idx] = in.obj_id;
     if (in.valid) {
-      recent_embeddings_[recent_idx_] = in.emb;
-      recent_valid_[recent_idx_] = true;
+      s.recent_embeddings[s.recent_idx] = in.emb;
+      s.recent_valid[s.recent_idx] = true;
     } else {
-      recent_valid_[recent_idx_] = false;
+      s.recent_valid[s.recent_idx] = false;
     }
-    recent_idx_ = (recent_idx_ + 1) % recent_window_;
-    if (recent_count_ < recent_window_) recent_count_++;
+    s.recent_idx = (s.recent_idx + 1) % recent_window_;
+    if (s.recent_count < recent_window_) s.recent_count++;
   }
 
   // Flush captured recency writes into the ring in shard order. Buckets by
   // hash(obj_id) % K, preserving in-shard (seq) order; interleave or group.
-  void flushRecencyReordered() {
+  void flushRecencyReordered(ShardState& s) {
     const int Ks = recency_shards_;
-    if (recency_buckets_.size() != static_cast<size_t>(Ks)) {
-      recency_buckets_.assign(Ks, {});
+    if (s.recency_buckets.size() != static_cast<size_t>(Ks)) {
+      s.recency_buckets.assign(Ks, {});
     } else {
-      for (auto& b : recency_buckets_) b.clear();
+      for (auto& b : s.recency_buckets) b.clear();
     }
-    for (auto& in : recency_intents_) {
-      recency_buckets_[hashObj(in.obj_id) % Ks].push_back(std::move(in));
+    for (auto& in : s.recency_intents) {
+      s.recency_buckets[hashObj(in.obj_id) % Ks].push_back(std::move(in));
     }
 
     if (recency_mode_ == 1) {
       // GROUP (pessimistic): concatenate shards, reorder ~batch.
-      for (int s = 0; s < Ks; s++)
-        for (auto& in : recency_buckets_[s]) writeRecent(in);
+      for (int b = 0; b < Ks; b++)
+        for (auto& in : s.recency_buckets[b]) writeRecent(s, in);
     } else {
       // INTERLEAVE (realistic): round-robin across shards, reorder ~K.
       size_t maxLen = 0;
-      for (int s = 0; s < Ks; s++)
-        maxLen = std::max(maxLen, recency_buckets_[s].size());
+      for (int b = 0; b < Ks; b++)
+        maxLen = std::max(maxLen, s.recency_buckets[b].size());
       for (size_t r = 0; r < maxLen; r++)
-        for (int s = 0; s < Ks; s++)
-          if (r < recency_buckets_[s].size()) writeRecent(recency_buckets_[s][r]);
+        for (int b = 0; b < Ks; b++)
+          if (r < s.recency_buckets[b].size()) writeRecent(s, s.recency_buckets[b][r]);
     }
   }
 
   // ---- embedding-cache LRU (capped/MCACHE mode) ----
-  void add_to_lru(uint64_t obj_id) {
-    lru_list_.push_front(obj_id);
-    lru_map_[obj_id] = lru_list_.begin();
+  void add_to_lru(ShardState& s, uint64_t obj_id) {
+    s.lru_list.push_front(obj_id);
+    s.lru_map[obj_id] = s.lru_list.begin();
   }
-  void move_to_front(uint64_t obj_id) {
-    auto it = lru_map_.find(obj_id);
-    if (it != lru_map_.end()) {
-      lru_list_.erase(it->second);
-      lru_list_.push_front(obj_id);
-      it->second = lru_list_.begin();
+  void move_to_front(ShardState& s, uint64_t obj_id) {
+    auto it = s.lru_map.find(obj_id);
+    if (it != s.lru_map.end()) {
+      s.lru_list.erase(it->second);
+      s.lru_list.push_front(obj_id);
+      it->second = s.lru_list.begin();
     }
   }
-  void evict_lru() {
-    if (lru_list_.empty()) return;
-    uint64_t lru_id = lru_list_.back();
-    lru_list_.pop_back();
-    lru_map_.erase(lru_id);
-    embeddings_.erase(lru_id);
+  void evict_lru(ShardState& s) {
+    if (s.lru_list.empty()) return;
+    uint64_t lru_id = s.lru_list.back();
+    s.lru_list.pop_back();
+    s.lru_map.erase(lru_id);
+    s.embeddings.erase(lru_id);
   }
 
-  void init_context() {
+  void init_context(ShardState& s) {
     for (int k = 0; k < K; k++)
-      for (int d = 0; d < D; d++) context_[k][d] = normal_dist_(rng_);
+      for (int d = 0; d < D; d++) s.context[k][d] = normal_dist_(s.rng);
   }
-  
-  void update_context_batch() {
+
+  void update_context_batch(ShardState& s) {
     double effective_speed = 10.0 * ctx_speed_;
     double decay = std::sqrt(1.0 - effective_speed);
     double noise_scale = std::sqrt(effective_speed);
     for (int k = 0; k < K; k++)
       for (int d = 0; d < D; d++)
-        context_[k][d] =
-            decay * context_[k][d] + noise_scale * normal_dist_(rng_);
+        s.context[k][d] =
+            decay * s.context[k][d] + noise_scale * normal_dist_(s.rng);
   }
 
-  void init_embedding(uint64_t obj_id) {
-    auto& emb = embeddings_[obj_id];
+  void init_embedding(ShardState& s, uint64_t obj_id) {
+    auto& emb = s.embeddings[obj_id];
     for (int k = 0; k < K; k++) {
       double sq_norm = 0.0;
       for (int d = 0; d < D; d++) {
-        double val = normal_dist_(rng_);
+        double val = normal_dist_(s.rng);
         emb.vectors[k][d] = val;
         sq_norm += val * val;
       }
       // Cache the computed norm immediately
-      emb.norms[k] = std::sqrt(sq_norm); 
+      emb.norms[k] = std::sqrt(sq_norm);
     }
   }
 
-  void update_embedding(uint64_t obj_id) {
-    auto& emb = embeddings_[obj_id];
+  void update_embedding(ShardState& s, uint64_t obj_id) {
+    auto& emb = s.embeddings[obj_id];
     double decay = std::sqrt(1.0 - lr_);
     double ctx_scale = std::sqrt(lr_);
-    
+
     for (int k = 0; k < K; k++) {
       double sq_norm = 0.0;
       for (int d = 0; d < D; d++) {
-        emb.vectors[k][d] = decay * emb.vectors[k][d] + ctx_scale * context_[k][d];
+        emb.vectors[k][d] = decay * emb.vectors[k][d] + ctx_scale * s.context[k][d];
         sq_norm += emb.vectors[k][d] * emb.vectors[k][d];
       }
       // Cache the computed norm immediately
@@ -444,17 +497,17 @@ class TARDISEmbeddingManager {
     }
   }
 
-  void update_recent(uint64_t obj_id) {
-    recent_ids_[recent_idx_] = obj_id;
-    auto it = embeddings_.find(obj_id);
-    if (it != embeddings_.end()) {
-      recent_embeddings_[recent_idx_] = it->second;
-      recent_valid_[recent_idx_] = true;
+  void update_recent(ShardState& s, uint64_t obj_id) {
+    s.recent_ids[s.recent_idx] = obj_id;
+    auto it = s.embeddings.find(obj_id);
+    if (it != s.embeddings.end()) {
+      s.recent_embeddings[s.recent_idx] = it->second;
+      s.recent_valid[s.recent_idx] = true;
     } else {
-      recent_valid_[recent_idx_] = false;
+      s.recent_valid[s.recent_idx] = false;
     }
-    recent_idx_ = (recent_idx_ + 1) % recent_window_;
-    if (recent_count_ < recent_window_) recent_count_++;
+    s.recent_idx = (s.recent_idx + 1) % recent_window_;
+    if (s.recent_count < recent_window_) s.recent_count++;
   }
 
   // Refactored to accept precomputed norms
@@ -475,25 +528,15 @@ class TARDISEmbeddingManager {
   int recency_shards_ = 1;   // TARDIS_RECENCY_SHARDS: 1 = OFF (inline baseline)
   int recency_mode_ = 0;     // TARDIS_RECENCY_MODE: 0 = interleave, 1 = group
 
-  // ---- embedding state (applier-owned; read under mutex) ----
+  // ---- embedding state, sharded per origin thread; read/written under
+  // state_mutex_ (applier is the sole writer; reads scan for the owning
+  // shard). ----
   mutable std::shared_mutex state_mutex_;
-  double context_[K][D];
-  std::unordered_map<uint64_t, EmbeddingData> embeddings_;
-  std::unordered_map<uint64_t, int> access_count_;
-  std::vector<EmbeddingData> recent_embeddings_;
-  std::vector<uint64_t> recent_ids_;
-  std::vector<bool> recent_valid_;
-  int recent_idx_ = 0;
-  int recent_count_ = 0;
-  int perturb_counter_ = 0;
-  std::mt19937 rng_;
+  std::array<ShardState, kMaxThreads> shards_;
   std::normal_distribution<double> normal_dist_{0.0, 1.0};
-  std::list<uint64_t> lru_list_;
-  std::unordered_map<uint64_t, std::list<uint64_t>::iterator> lru_map_;
 
-  // Phase 1b scratch (applier-owned; touched only under the write lock)
-  std::vector<RecencyIntent> recency_intents_;
-  std::vector<std::vector<RecencyIntent>> recency_buckets_;
+  // Applier-thread-owned scratch (never touched by any other thread).
+  std::vector<int> touchedShards_;
 
   // ---- log infrastructure ----
   std::unique_ptr<folly::ProducerConsumerQueue<AccessEvent>>

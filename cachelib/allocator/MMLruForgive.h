@@ -313,6 +313,39 @@ class MMLruForgive {
       return folly::hash::SpookyHashV2::Hash64(key.data(), key.size(), 0);
     }
 
+    // mybench encodes the owning worker thread's reader_id into the key
+    // itself (mybench/reader.cpp: obj_id = obj_id % UINT32_MAX +
+    // reader_id * 1e9, then stringified via fmt::format_int in cache.cpp's
+    // gen_key). Decoding it back lets embedding manager reads/writes go
+    // directly to the owning shard instead of scanning all shards. This is a
+    // benchmark-specific assumption about key encoding; non-numeric keys
+    // (e.g. from unit tests) fall back to shard 0.
+    static int shardOfKey(const T& node) noexcept {
+      auto key = node.getKey();
+      uint64_t value = 0;
+      for (char c : key) {
+        if (c < '0' || c > '9') break;
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+      }
+      return static_cast<int>(
+          (value / 1'000'000'000ULL) % TARDISEmbeddingManager::kMaxThreads);
+    }
+
+    // recordAccess always runs on the thread that owns the accessed key (each
+    // mybench worker only ever touches its own disjoint key range), so the
+    // shard is constant for a thread's whole lifetime. Decode it from the key
+    // once and cache it thread-locally instead of re-parsing on every access.
+    // Eviction-time reads can't use this: the evicting thread generally isn't
+    // the owner of the candidate it's looking at, so they must keep calling
+    // shardOfKey() on the specific candidate.
+    static int cachedShardOfKey(const T& node) noexcept {
+      thread_local int cached = -1;
+      if (cached < 0) {
+        cached = shardOfKey(node);
+      }
+      return cached;
+    }
+
     // Walk the tail and promote forgivable candidates. Caller must hold the
     // lru mutex. Returns the iterator pointing at the first non-forgivable
     // tail (or end if everything was forgiven, which would be a degenerate

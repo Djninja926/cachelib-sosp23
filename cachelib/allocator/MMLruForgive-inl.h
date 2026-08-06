@@ -49,7 +49,7 @@ bool MMLruForgive::Container<T, HookPtr>::recordAccess(
   // TARDIS: update embedding on EVERY access, regardless of LRU refresh-time
   // gate or updateOnRead/updateOnWrite flags. This is essential for
   // correctness against the libCacheSim reference, which records every event.
-  embMgr_->on_access(hashKey(node));
+  embMgr_->on_access(hashKey(node), cachedShardOfKey(node));
 
   // Standard MMLru recordAccess logic from here down
   if ((mode == AccessMode::kWrite && !config_.updateOnWrite) ||
@@ -229,18 +229,19 @@ void MMLruForgive::Container<T, HookPtr>::applyForgivenessLocked() noexcept {
     nCandidates_++;
 
     uint64_t obj_id = hashKey(*tail);
-    int access_count = embMgr_->get_access_count(obj_id);
+    int shard = shardOfKey(*tail);
+    int access_count = embMgr_->get_access_count(obj_id, shard);
 
     // Candidate must have enough accesses to have an embedding
     if (access_count < minAccess) {
       return;
     }
-    if (!embMgr_->has_embedding(obj_id)) {
+    if (!embMgr_->has_embedding(obj_id, shard)) {
       return;
     }
     nQualified_++;
 
-    double similarity = embMgr_->avg_top_k_similarity_to_recent(obj_id, topK);
+    double similarity = embMgr_->avg_top_k_similarity_to_recent(obj_id, shard, topK);
     if (similarity < threshold) {
       return;  // Not forgivable, stop walking
     }
