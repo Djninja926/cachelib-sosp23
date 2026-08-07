@@ -39,9 +39,16 @@
  * ---------------------------------------------------------------------------
  * Thread-local redesign
  *
- * Every mybench worker thread owns a disjoint key space, so each shard is 
+ * Every mybench worker thread owns a disjoint key space, so each shard is
  * logically written on behalf of exactly one origin thread.
- 
+ *
+ * ---------------------------------------------------------------------------
+ * Per-shard appliers
+ *
+ * One SPSC queue + one applier thread + one shared_mutex per shard, instead
+ * of a single global queue-merge/lock/applier. A shard's applier is spawned
+ * lazily on that shard's first on_access. Since no shard depends on another shard's
+ * state, each applier operates fully independently.
  * ---------------------------------------------------------------------------
  */
 
@@ -83,7 +90,6 @@ class TARDISEmbeddingManager {
 
   struct AccessEvent {
     uint64_t obj_id;
-    int shard;
   };
 
   // ---- Phase 1b recency-intent record ----
@@ -97,9 +103,9 @@ class TARDISEmbeddingManager {
   static constexpr size_t kQueueCapacity = 1u << 20;
   static constexpr size_t kBatchSize = 256;
 
-  // Per-origin-thread embedding state. Written only by the applier thread,
-  // but always on behalf of exactly one origin shard (see AccessEvent::shard),
-  // so each ShardState is logically single-writer.
+  // Per-origin-thread embedding state. Written only by that shard's own
+  // applier thread, so each ShardState is single-writer with no cross-shard
+  // dependency anywhere below.
   struct ShardState {
     double context[K][D];
     std::unordered_map<uint64_t, EmbeddingData> embeddings;
@@ -111,6 +117,7 @@ class TARDISEmbeddingManager {
     int recent_count = 0;
     int perturb_counter = 0;
     std::mt19937 rng;
+    std::normal_distribution<double> normal_dist{0.0, 1.0};
 
     // ---- embedding-cache LRU (capped/MCACHE mode) ----
     std::list<uint64_t> lru_list;
@@ -118,7 +125,6 @@ class TARDISEmbeddingManager {
 
     std::vector<RecencyIntent> recency_intents;
     std::vector<std::vector<RecencyIntent>> recency_buckets;
-    bool recencyTouchedThisBatch = false;
   };
 
   TARDISEmbeddingManager(double lr,
@@ -141,7 +147,7 @@ class TARDISEmbeddingManager {
       s.recent_valid.resize(recent_window_, false);
     }
 
-    // Phase 1b recency-reorder knobs (read BEFORE the applier thread spawns).
+    // Phase 1b recency-reorder knobs (read BEFORE any applier thread spawns).
     if (const char* s = std::getenv("TARDIS_RECENCY_SHARDS")) {
       recency_shards_ = std::atoi(s);
       if (recency_shards_ < 1) recency_shards_ = 1;
@@ -149,11 +155,11 @@ class TARDISEmbeddingManager {
     if (const char* m = std::getenv("TARDIS_RECENCY_MODE")) {
       recency_mode_ = std::atoi(m);
     }
-    // Core to pin the applier thread to, so it doesn't float onto a core
-    // mybench has pinned a worker to (or migrate cross-NUMA away from the
-    // shard state, which follows the process's numactl --membind policy).
-    // Worker pinning (mybench/benchMT.cpp) only ever uses even cores, so
-    // core 1 is never claimed by a worker; -1 disables pinning.
+    // Base core for pinning per-shard appliers: shard i pins to core
+    // applier_core_ + 2*i, so it doesn't float onto a core mybench has
+    // pinned a worker to (workers only ever use even cores, see
+    // mybench/benchMT.cpp) or migrate cross-NUMA away from its shard state.
+    // -1 disables pinning entirely.
     if (const char* c = std::getenv("TARDIS_APPLIER_CORE")) {
       applier_core_ = std::atoi(c);
     }
@@ -162,21 +168,16 @@ class TARDISEmbeddingManager {
       buffers_[i] =
           std::make_unique<folly::ProducerConsumerQueue<AccessEvent>>(
               kQueueCapacity);
-    }
-    applier_ = std::thread(&TARDISEmbeddingManager::applierLoop, this);
-    if (applier_core_ >= 0) {
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(applier_core_, &cpuset);
-      pthread_setaffinity_np(applier_.native_handle(), sizeof(cpu_set_t),
-                              &cpuset);
+      applierStarted_[i].store(false, std::memory_order_relaxed);
     }
   }
 
   ~TARDISEmbeddingManager() {
     stop_.store(true, std::memory_order_release);
-    if (applier_.joinable()) {
-      applier_.join();
+    for (int i = 0; i < kMaxThreads; i++) {
+      if (appliers_[i].joinable()) {
+        appliers_[i].join();
+      }
     }
   }
 
@@ -186,7 +187,8 @@ class TARDISEmbeddingManager {
   // ---- HOT PATH ----
   // `shard` is the object's owning shard, decoded by the caller from the key
   void on_access(uint64_t obj_id, int shard) {
-    AccessEvent ev{obj_id, shard};
+    ensureApplierStarted(shard);
+    AccessEvent ev{obj_id};
     while (!buffers_[shard]->write(ev)) {
       std::this_thread::yield();
     }
@@ -195,7 +197,7 @@ class TARDISEmbeddingManager {
   // ---- READ PATH (eviction-time forgiveness) ----
   // `shard` is the candidate's owning shard
   double avg_top_k_similarity_to_recent(uint64_t obj_id, int shard, int top_k = 3) {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    std::shared_lock<std::shared_mutex> lock(state_mutex_[shard]);
     const auto& s = shards_[shard];
     auto it = s.embeddings.find(obj_id);
     if (it == s.embeddings.end()) return 0.0;
@@ -241,21 +243,23 @@ class TARDISEmbeddingManager {
   }
 
   int get_access_count(uint64_t obj_id, int shard) const {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    std::shared_lock<std::shared_mutex> lock(state_mutex_[shard]);
     const auto& s = shards_[shard];
     auto it = s.access_count.find(obj_id);
     return it != s.access_count.end() ? it->second : 0;
   }
 
   bool has_embedding(uint64_t obj_id, int shard) const {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
+    std::shared_lock<std::shared_mutex> lock(state_mutex_[shard]);
     return shards_[shard].embeddings.count(obj_id) > 0;
   }
 
   size_t get_num_embeddings() const {
-    std::shared_lock<std::shared_mutex> lock(state_mutex_);
     size_t total = 0;
-    for (const auto& s : shards_) total += s.embeddings.size();
+    for (int i = 0; i < kMaxThreads; i++) {
+      std::shared_lock<std::shared_mutex> lock(state_mutex_[i]);
+      total += shards_[i].embeddings.size();
+    }
     return total;
   }
 
@@ -267,22 +271,51 @@ class TARDISEmbeddingManager {
     return x;
   }
 
-  // ---- BACKGROUND APPLIER (batched) ----
-  // Each buffers_[i] is a single-producer/single-consumer queue, so draining
+  // Lazily spawn shard i's dedicated applier thread on its first access, so
+  // shards a run never uses (most of the 64 slots, for typical thread
+  // counts) never spin up a thread. Safe under concurrent first-touch even
+  // though in practice exactly one origin thread ever calls this for a
+  // given shard.
+  void ensureApplierStarted(int shard) {
+    if (applierStarted_[shard].load(std::memory_order_acquire)) {
+      return;
+    }
+    bool expected = false;
+    if (applierStarted_[shard].compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) {
+      appliers_[shard] =
+          std::thread(&TARDISEmbeddingManager::applierLoopForShard, this,
+                      shard);
+      if (applier_core_ >= 0) {
+        const int core = applier_core_ + 2 * shard;
+        if (core < static_cast<int>(std::thread::hardware_concurrency())) {
+          cpu_set_t cpuset;
+          CPU_ZERO(&cpuset);
+          CPU_SET(core, &cpuset);
+          pthread_setaffinity_np(appliers_[shard].native_handle(),
+                                  sizeof(cpu_set_t), &cpuset);
+        }
+      }
+    }
+  }
+
+  // ---- BACKGROUND APPLIER (batched), one per shard ----
+  // buffers_[shard] is a single-producer/single-consumer queue, so draining
   // it in order already preserves that origin thread's chronological order.
-  // No shard depends on another shard's state, so no cross-thread
-  // interleaving order needs to be reconstructed here either.
-  void applierLoop() {
+  // No shard depends on another shard's state, so this applier never needs
+  // to coordinate with any other shard's applier or readers.
+  void applierLoopForShard(int shard) {
+    auto& buf = *buffers_[shard];
+    ShardState& s = shards_[shard];
+    std::shared_mutex& mtx = state_mutex_[shard];
     std::vector<AccessEvent> batch;
     batch.reserve(kBatchSize);
 
     auto drainOnce = [&]() {
       batch.clear();
       AccessEvent ev;
-      for (int i = 0; i < kMaxThreads && batch.size() < kBatchSize; i++) {
-        while (batch.size() < kBatchSize && buffers_[i]->read(ev)) {
-          batch.push_back(ev);
-        }
+      while (batch.size() < kBatchSize && buf.read(ev)) {
+        batch.push_back(ev);
       }
     };
 
@@ -290,37 +323,29 @@ class TARDISEmbeddingManager {
       drainOnce();
 
       if (!batch.empty()) {
-        applyBatch(batch);
+        applyBatchForShard(s, mtx, batch);
         continue;
       }
 
       if (stop_.load(std::memory_order_acquire)) {
         drainOnce();
         if (batch.empty()) break;
-        applyBatch(batch);
+        applyBatchForShard(s, mtx, batch);
         continue;
       }
       std::this_thread::yield();
     }
   }
 
-  void applyBatch(const std::vector<AccessEvent>& batch) {
-    std::unique_lock<std::shared_mutex> lock(state_mutex_);
-    if (recency_shards_ > 1) touchedShards_.clear();
+  void applyBatchForShard(ShardState& s, std::shared_mutex& mtx,
+                           const std::vector<AccessEvent>& batch) {
+    std::unique_lock<std::shared_mutex> lock(mtx);
+    if (recency_shards_ > 1) s.recency_intents.clear();
     for (const auto& ev : batch) {
-      ShardState& s = shards_[ev.shard];
-      if (recency_shards_ > 1 && !s.recencyTouchedThisBatch) {
-        s.recency_intents.clear();
-        s.recencyTouchedThisBatch = true;
-        touchedShards_.push_back(ev.shard);
-      }
       applyEventLocked(s, ev);
     }
     if (recency_shards_ > 1) {
-      for (int idx : touchedShards_) {
-        flushRecencyReordered(shards_[idx]);
-        shards_[idx].recencyTouchedThisBatch = false;
-      }
+      flushRecencyReordered(s);
     }
   }
 
@@ -441,7 +466,7 @@ class TARDISEmbeddingManager {
 
   void init_context(ShardState& s) {
     for (int k = 0; k < K; k++)
-      for (int d = 0; d < D; d++) s.context[k][d] = normal_dist_(s.rng);
+      for (int d = 0; d < D; d++) s.context[k][d] = s.normal_dist(s.rng);
   }
 
   void update_context_batch(ShardState& s) {
@@ -451,7 +476,7 @@ class TARDISEmbeddingManager {
     for (int k = 0; k < K; k++)
       for (int d = 0; d < D; d++)
         s.context[k][d] =
-            decay * s.context[k][d] + noise_scale * normal_dist_(s.rng);
+            decay * s.context[k][d] + noise_scale * s.normal_dist(s.rng);
   }
 
   void init_embedding(ShardState& s, uint64_t obj_id) {
@@ -459,7 +484,7 @@ class TARDISEmbeddingManager {
     for (int k = 0; k < K; k++) {
       double sq_norm = 0.0;
       for (int d = 0; d < D; d++) {
-        double val = normal_dist_(s.rng);
+        double val = s.normal_dist(s.rng);
         emb.vectors[k][d] = val;
         sq_norm += val * val;
       }
@@ -514,22 +539,23 @@ class TARDISEmbeddingManager {
   int64_t max_entries_;
   int recency_shards_ = 1;   // TARDIS_RECENCY_SHARDS: 1 = OFF (inline baseline)
   int recency_mode_ = 0;     // TARDIS_RECENCY_MODE: 0 = interleave, 1 = group
-  int applier_core_ = 1;     // TARDIS_APPLIER_CORE: CPU to pin applier to (-1 = off)
+  int applier_core_ = 1;     // TARDIS_APPLIER_CORE: base core for per-shard
+                             // applier pinning, shard i -> core + 2*i
+                             // (-1 = off)
 
-  // ---- embedding state, sharded per origin thread; read/written under
-  // state_mutex_ (applier is the sole writer; reads scan for the owning
-  // shard). ----
-  mutable std::shared_mutex state_mutex_;
+  // ---- embedding state, sharded per origin thread. state_mutex_[i] guards
+  // shards_[i] only; shard i's applier is state_mutex_[i]'s sole writer, so
+  // no shard's lock is ever touched by another shard's applier or readers.
+  // ----
+  mutable std::array<std::shared_mutex, kMaxThreads> state_mutex_;
   std::array<ShardState, kMaxThreads> shards_;
-  std::normal_distribution<double> normal_dist_{0.0, 1.0};
 
-  // Applier-thread-owned scratch (never touched by any other thread).
-  std::vector<int> touchedShards_;
-
-  // ---- log infrastructure ----
+  // ---- log infrastructure: one SPSC queue + one applier thread per shard,
+  // the latter spawned lazily on that shard's first access. ----
   std::unique_ptr<folly::ProducerConsumerQueue<AccessEvent>>
       buffers_[kMaxThreads];
-  std::thread applier_;
+  std::array<std::thread, kMaxThreads> appliers_;
+  std::array<std::atomic<bool>, kMaxThreads> applierStarted_;
   std::atomic<bool> stop_{false};
 };
 
