@@ -27,6 +27,7 @@ struct reader {
   const int32_t *default_ttls;
   int default_ttl_idx;
   int64_t n_trace_req;
+  bool shared_mode;   // true = shared mode: all readers see the same key space
 
   enum trace_type trace_type;
   int record_size; /* the size the trace uses to store a request entry */

@@ -61,6 +61,7 @@ static void trace_replay_run_thread(struct bench_data *bdata,
   struct reader *reader =
       open_trace(opts->trace_path, opts->trace_type, thread_id);
 
+  reader->shared_mode = (opts->mode == 1);
   res->n_get = res->n_set = res->n_get_miss = res->n_del = 0;
 
   int status = read_trace(reader, req);
@@ -78,13 +79,19 @@ static void trace_replay_run_thread(struct bench_data *bdata,
   const bool shared = (opts->mode == 1);
   const uint64_t my_id = static_cast<uint64_t>(thread_id - 1);
   const uint64_t nthr = static_cast<uint64_t>(opts->n_thread);
+  reader->offset = 0;
   uint64_t record_idx = 0;
 
   while (read_trace(reader, req) == 0) {
     // record_idx is the global trace position of this record (both modes).
+    // const uint64_t this_seq = record_idx++;
+    // // Round-robin shared mode: only process records assigned to this thread.
+    // if (shared && (record_idx++ % nthr) != my_id) {
+    //   continue;
+    // }
+
     const uint64_t this_seq = record_idx++;
-    // Round-robin shared mode: only process records assigned to this thread.
-    if (shared && (record_idx++ % nthr) != my_id) {
+    if (shared && (this_seq % nthr) != my_id) {
       continue;
     }
 

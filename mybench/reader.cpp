@@ -127,7 +127,14 @@ int read_oracleGeneral_trace(struct reader *reader, struct request *req) {
 
   uint64_t obj_id = *(uint64_t *)(record + 4);
   // used to make sure each reader has different keys
-  obj_id = obj_id % (uint64_t)UINT32_MAX + reader->reader_id * 1000000000ULL;
+  // obj_id = obj_id % (uint64_t)UINT32_MAX + reader->reader_id * 1000000000ULL;
+  // only give each reader a disjoint key range in REPLICATED mode;
+  // in shared mode all threads must see the same keys.
+  if (!reader->shared_mode) {
+    obj_id = obj_id % (uint64_t)UINT32_MAX + reader->reader_id * 1000000000ULL;
+  } else {
+    obj_id = obj_id % (uint64_t)UINT32_MAX;
+  }
   *(uint64_t *)req->key = obj_id;
 
   req->key_len = 8;
