@@ -187,11 +187,14 @@ class TARDISEmbeddingManager {
   // ---- HOT PATH ----
   // `shard` is the object's owning shard, decoded by the caller from the key
   void on_access(uint64_t obj_id, int shard) {
-    ensureApplierStarted(shard);
-    AccessEvent ev{obj_id};
-    while (!buffers_[shard]->write(ev)) {
-      std::this_thread::yield();
-    }
+    // Inline apply: each shard is single-writer in replicated mode, so the
+    // per-shard applier thread is unnecessary. Applying directly here removes
+    // one spinning applier thread per shard (the Phase 2 spin-thrash cost) and
+    // preserves per-shard chronological order trivially. The per-shard lock is
+    // kept because on one shared cache, an eviction on another thread can read
+    // this shard during forgiveness (avg_top_k takes a shared_lock).
+    std::unique_lock<std::shared_mutex> lock(state_mutex_[shard]);
+    applyEventLocked(shards_[shard], AccessEvent{obj_id});
   }
 
   // ---- READ PATH (eviction-time forgiveness) ----
