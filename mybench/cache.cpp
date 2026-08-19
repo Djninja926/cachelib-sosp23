@@ -77,11 +77,24 @@ void mycache_init(int64_t cache_size_in_mb, unsigned int hashpower,
   *pool_p = (*cache_p)->addPool("default",
                                 (*cache_p)->getCacheMemoryStats().ramCacheSize,
                                 {}, mm_config);
+#elif defined(USE_S3FIFOFORGIVE)
+  Cache::MMConfig mm_config;
+  constexpr int64_t kAvgObjSize = 34000;
+  int64_t est_cache_items =
+      (cache_size_in_mb * 1024LL * 1024LL) / kAvgObjSize;
+  mm_config.maxEmbeddingEntries = 5 * est_cache_items;
+  fprintf(stderr,
+          "[S3FIFOFORGIVE] cache_mb=%ld, est_cache_items=%ld, "
+          "maxEmbeddingEntries=%ld (MCACHE 5x)\n",
+          (long)cache_size_in_mb, (long)est_cache_items,
+          (long)mm_config.maxEmbeddingEntries);
+  *pool_p = (*cache_p)->addPool("default",
+                                (*cache_p)->getCacheMemoryStats().ramCacheSize,
+                                {}, mm_config);
 #else
   *pool_p = (*cache_p)->addPool("default",
                                 (*cache_p)->getCacheMemoryStats().ramCacheSize);
 #endif
-
 
   util::setCurrentTimeSec(1);
   assert(util::getCurrentTimeSec() == 1);

@@ -65,3 +65,7 @@ target_link_libraries(sieve cachelib fmt::fmt atomic)
 add_executable(s3fifo main.cpp reader.cpp bench.cpp benchMT.cpp cache.cpp)
 target_compile_definitions(s3fifo PRIVATE USE_S3FIFO)
 target_link_libraries(s3fifo cachelib fmt::fmt atomic) 
+
+add_executable(s3fifoforgive main.cpp reader.cpp bench.cpp benchMT.cpp cache.cpp)
+target_compile_definitions(s3fifoforgive PRIVATE USE_S3FIFOFORGIVE)
+target_link_libraries(s3fifoforgive cachelib fmt::fmt atomic) 

@@ -97,13 +97,17 @@ class TARDISEmbeddingManager {
   TARDISEmbeddingManager& operator=(const TARDISEmbeddingManager&) = delete;
 
   // ---- HOT PATH ----
+  // void on_access(uint64_t obj_id) {
+  //   const int tid = threadSlot();
+  //   AccessEvent ev{obj_id, current_trace_seq};
+  //   uint32_t idle = 0;
+  //   while (!buffers_[tid]->write(ev)) {
+  //     idle_backoff(idle++);
+  //   }
+  // }
   void on_access(uint64_t obj_id) {
-    const int tid = threadSlot();
-    AccessEvent ev{obj_id, current_trace_seq};
-    uint32_t idle = 0;
-    while (!buffers_[tid]->write(ev)) {
-      idle_backoff(idle++);
-    }
+    std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    applyEventLocked(AccessEvent{obj_id, current_trace_seq});
   }
 
   // ---- READ PATH (eviction-time forgiveness) ----
