@@ -34,6 +34,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <cstdlib>
 
 #include <folly/ProducerConsumerQueue.h>
 
@@ -74,6 +75,8 @@ class TARDISEmbeddingManager {
         max_entries_(max_entries),
         rng_(seed) {
     init_context();
+    if (const char* r = std::getenv("TARDIS_SAMPLE_RATE")) sample_rate_ = std::atof(r);
+    if (const char* m = std::getenv("TARDIS_SAMPLE_MODE"))  sample_mode_ = std::atoi(m);
     recent_embeddings_.resize(recent_window_);
     recent_ids_.resize(recent_window_);
     recent_valid_.resize(recent_window_, false);
@@ -96,17 +99,22 @@ class TARDISEmbeddingManager {
   TARDISEmbeddingManager(const TARDISEmbeddingManager&) = delete;
   TARDISEmbeddingManager& operator=(const TARDISEmbeddingManager&) = delete;
 
-  // ---- HOT PATH ----
-  // void on_access(uint64_t obj_id) {
-  //   const int tid = threadSlot();
-  //   AccessEvent ev{obj_id, current_trace_seq};
-  //   uint32_t idle = 0;
-  //   while (!buffers_[tid]->write(ev)) {
-  //     idle_backoff(idle++);
-  //   }
-  // }
   void on_access(uint64_t obj_id) {
     std::unique_lock<std::shared_mutex> lock(state_mutex_);
+    // Variant 1 (mode 0): subsample the entire update.
+    if (sample_mode_ == 0 && sample_rate_ < 1.0) {
+      if (std::uniform_real_distribution<double>(0.0, 1.0)(rng_) >= sample_rate_) {
+        return;  // skip whole event: no count, no recency, no embedding
+      }
+    }
+    // Variant 2 (mode 2): deterministic global every-Nth access, skip whole event.
+    if (sample_mode_ == 2 && sample_rate_ < 1.0) {
+      long N = std::llround(1.0 / sample_rate_);   // 0.25 -> every 4th, 0.1 -> every 10th
+      if (N < 1) N = 1;
+      if ((++sample_counter_ % (uint64_t)N) != 0) {
+        return;  // skip unless this is the Nth access
+      }
+    }
     applyEventLocked(AccessEvent{obj_id, current_trace_seq});
   }
 
@@ -267,13 +275,26 @@ class TARDISEmbeddingManager {
   void applyEventLocked(const AccessEvent& ev) {
     const uint64_t obj_id = ev.obj_id;
 
-    if (++perturb_counter_ >= 10) {
+    // Variant 2 (mode 1): subsample only the heavy embedding math. access_count
+    // still increments every access; context advance, embedding update/init,
+    // and recency are skipped on non-sampled accesses.
+    bool doEmbedding = true;
+    if (sample_mode_ == 1 && sample_rate_ < 1.0) {
+      doEmbedding =
+          (std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < sample_rate_);
+    }
+
+    if (doEmbedding && ++perturb_counter_ >= 10) {
       perturb_counter_ = 0;
       update_context_batch();
     }
 
     int& count = access_count_[obj_id];
     count++;
+
+    if (!doEmbedding) {
+      return;  // bookkeeping only; skip embedding update/init and recency
+    }
 
     auto it = embeddings_.find(obj_id);
     bool has_emb = (it != embeddings_.end());
@@ -393,6 +414,9 @@ class TARDISEmbeddingManager {
   int recent_window_;
   int min_access_count_;
   int64_t max_entries_;
+  double sample_rate_ = 1.0;   // TARDIS_SAMPLE_RATE
+  int    sample_mode_ = 0;     // TARDIS_SAMPLE_MODE: 0=skip whole event, 1=skip only embedding math
+  uint64_t sample_counter_ = 0;   // for mode 2 deterministic every-Nth
 
   // ---- embedding state (applier-owned; read under mutex) ----
   mutable std::shared_mutex state_mutex_;
