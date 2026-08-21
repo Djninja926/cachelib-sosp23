@@ -117,6 +117,7 @@ class TARDISEmbeddingManager {
     int recent_count = 0;
     int perturb_counter = 0;
     std::mt19937 rng;
+    uint64_t sample_counter = 0;   // for mode 2 deterministic every-Nth
     std::normal_distribution<double> normal_dist{0.0, 1.0};
 
     // ---- embedding-cache LRU (capped/MCACHE mode) ----
@@ -163,6 +164,12 @@ class TARDISEmbeddingManager {
     if (const char* c = std::getenv("TARDIS_APPLIER_CORE")) {
       applier_core_ = std::atoi(c);
     }
+        if (const char* r = std::getenv("TARDIS_SAMPLE_RATE")) {
+      sample_rate_ = std::atof(r);
+    }
+    if (const char* m = std::getenv("TARDIS_SAMPLE_MODE")) {
+      sample_mode_ = std::atoi(m);
+    }
 
     for (int i = 0; i < kMaxThreads; i++) {
       buffers_[i] =
@@ -193,8 +200,29 @@ class TARDISEmbeddingManager {
     // preserves per-shard chronological order trivially. The per-shard lock is
     // kept because on one shared cache, an eviction on another thread can read
     // this shard during forgiveness (avg_top_k takes a shared_lock).
+    // ORIGINAL
+    // std::unique_lock<std::shared_mutex> lock(state_mutex_[shard]);
+    // applyEventLocked(shards_[shard], AccessEvent{obj_id});
+
+    // NEW
     std::unique_lock<std::shared_mutex> lock(state_mutex_[shard]);
-    applyEventLocked(shards_[shard], AccessEvent{obj_id});
+    ShardState& s = shards_[shard];
+    // Subsampling. mode 0 (whole): skip the entire update on non-sampled
+    // accesses. mode 1 (update): always do bookkeeping, sample only the heavy
+    // embedding math (gate is inside applyEventLocked).
+    if (sample_mode_ == 0 && sample_rate_ < 1.0) {
+      if (std::uniform_real_distribution<double>(0.0, 1.0)(s.rng) >= sample_rate_) {
+        return;
+      }
+    }
+    if (sample_mode_ == 2 && sample_rate_ < 1.0) {
+      long N = std::llround(1.0 / sample_rate_);
+      if (N < 1) N = 1;
+      if ((++s.sample_counter % (uint64_t)N) != 0) {
+        return;
+      }
+    }
+    applyEventLocked(s, AccessEvent{obj_id});
   }
 
   // ---- READ PATH (eviction-time forgiveness) ----
@@ -355,7 +383,16 @@ class TARDISEmbeddingManager {
   void applyEventLocked(ShardState& s, const AccessEvent& ev) {
     const uint64_t obj_id = ev.obj_id;
 
-    if (++s.perturb_counter >= 10) {
+    // Variant 2 (mode 1): subsample only the heavy embedding math. Bookkeeping
+    // (access_count) still runs every access; the context advance, embedding
+    // update, and embedding init are skipped on non-sampled accesses.
+    bool doEmbedding = true;
+    if (sample_mode_ == 1 && sample_rate_ < 1.0) {
+      doEmbedding =
+          (std::uniform_real_distribution<double>(0.0, 1.0)(s.rng) < sample_rate_);
+    }
+
+    if (doEmbedding && ++s.perturb_counter >= 10) {
       s.perturb_counter = 0;
       update_context_batch(s);
     }
@@ -363,9 +400,12 @@ class TARDISEmbeddingManager {
     int& count = s.access_count[obj_id];
     count++;
 
+    if (!doEmbedding) {
+      return;  // cheap bookkeeping only; skip embedding update/init and recency
+    }
+
     auto it = s.embeddings.find(obj_id);
     bool has_emb = (it != s.embeddings.end());
-
     if (has_emb) {
       update_embedding(s, obj_id);
       if (max_entries_ >= 0) {
@@ -386,6 +426,41 @@ class TARDISEmbeddingManager {
       record_recent(s, obj_id);
     }
   }
+
+  // void applyEventLocked(ShardState& s, const AccessEvent& ev) {
+  //   const uint64_t obj_id = ev.obj_id;
+
+  //   if (++s.perturb_counter >= 10) {
+  //     s.perturb_counter = 0;
+  //     update_context_batch(s);
+  //   }
+
+  //   int& count = s.access_count[obj_id];
+  //   count++;
+
+  //   auto it = s.embeddings.find(obj_id);
+  //   bool has_emb = (it != s.embeddings.end());
+
+  //   if (has_emb) {
+  //     update_embedding(s, obj_id);
+  //     if (max_entries_ >= 0) {
+  //       move_to_front(s, obj_id);
+  //     }
+  //     record_recent(s, obj_id);
+  //   } else if (count == min_access_count_) {
+  //     if (max_entries_ >= 0) {
+  //       while (static_cast<int64_t>(s.embeddings.size()) >= max_entries_ &&
+  //              !s.lru_list.empty()) {
+  //         evict_lru(s);
+  //       }
+  //       init_embedding(s, obj_id);
+  //       add_to_lru(s, obj_id);
+  //     } else {
+  //       init_embedding(s, obj_id);
+  //     }
+  //     record_recent(s, obj_id);
+  //   }
+  // }
 
   // Recency sink: inline (baseline) when not sharding, else capture the write
   // (obj_id + embedding snapshot at THIS seq position) for a reordered flush.
@@ -542,9 +617,11 @@ class TARDISEmbeddingManager {
   int64_t max_entries_;
   int recency_shards_ = 1;   // TARDIS_RECENCY_SHARDS: 1 = OFF (inline baseline)
   int recency_mode_ = 0;     // TARDIS_RECENCY_MODE: 0 = interleave, 1 = group
-  int applier_core_ = 1;     // TARDIS_APPLIER_CORE: base core for per-shard
+  int applier_core_ = -1;     // TARDIS_APPLIER_CORE: base core for per-shard
                              // applier pinning, shard i -> core + 2*i
                              // (-1 = off)
+  double sample_rate_ = 1.0;      // TARDIS_SAMPLE_RATE: fraction of accesses that update embeddings
+  int    sample_mode_ = 0;        // TARDIS_SAMPLE_MODE: 0 = skip whole event, 1 = skip only embedding math
 
   // ---- embedding state, sharded per origin thread. state_mutex_[i] guards
   // shards_[i] only; shard i's applier is state_mutex_[i]'s sole writer, so
