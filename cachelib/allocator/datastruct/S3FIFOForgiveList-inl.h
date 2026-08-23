@@ -19,6 +19,9 @@ T* S3FIFOForgiveList<T, HookPtr>::getEvictionCandidate() noexcept {
     return nullptr;
   }
 
+  int forgivesThisCall = 0;
+  const int maxForgivesPerCall = 50;  // guarantee progress
+
   T* curr = nullptr;
   if (!hist_.initialized()) {
     LockHolder l(*mtx_);
@@ -46,14 +49,21 @@ T* S3FIFOForgiveList<T, HookPtr>::getEvictionCandidate() noexcept {
         unmarkProbationary(*curr);
         markMain(*curr);
         mfifo_->linkAtHead(*curr);
-      } else if (shouldForgive(*curr)) {
-        XDCHECK(isProbationary(*curr));
-        unmarkProbationary(*curr);
-        markMain(*curr);
-        mfifo_->linkAtHead(*curr);
-        long n = nForgive_.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (n == 1 || (n % 500000) == 0)
-          fprintf(stderr, "[S3FF] nForgive=%ld\n", n);   // <-- temporary probe
+      } else if (forgivesThisCall < maxForgivesPerCall && shouldForgive(*curr)) {
+          forgivesThisCall++;
+          if (markAccessed_) {
+            // set accessed bit and keep in small: earns normal S3-FIFO promotion
+            // on its next lap to the small-FIFO tail (via the isAccessed branch).
+            pfifo_->markAccessed(*curr);
+            pfifo_->linkAtHead(*curr);
+          } else if (keepInSmall_) {
+            pfifo_->linkAtHead(*curr);
+          } else {
+            unmarkProbationary(*curr);
+            markMain(*curr);
+            mfifo_->linkAtHead(*curr);
+          }
+        nForgive_.fetch_add(1, std::memory_order_relaxed);
       } else {
         // S3-FIFO: drop the one-hit-wonder (record in history, evict).
         hist_.insert(hashNode(*curr));
