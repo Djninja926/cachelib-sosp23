@@ -2124,6 +2124,7 @@ extern template class CacheAllocator<ClockCacheTrait>;
 extern template class CacheAllocator<SieveCacheTrait>;
 // extern template class CacheAllocator<SieveBufferedCacheTrait>;
 extern template class CacheAllocator<S3FIFOCacheTrait>;
+extern template class CacheAllocator<S3FIFOForgiveCacheTrait>;
 
 // CacheAllocator with an LRU eviction policy
 // LRU policy can be configured to act as a segmented LRU as well
@@ -2153,5 +2154,6 @@ using SieveAllocator = CacheAllocator<SieveCacheTrait>;
 // using SieveBufferedAllocator = CacheAllocator<SieveBufferedCacheTrait>;
 
 using S3FIFOAllocator = CacheAllocator<S3FIFOCacheTrait>;
+using S3FIFOForgiveAllocator = CacheAllocator<S3FIFOForgiveCacheTrait>;
 }  // namespace cachelib
 }  // namespace facebook

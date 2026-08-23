@@ -22,6 +22,7 @@
 #include "cachelib/allocator/MMClock.h"
 #include "cachelib/allocator/MMSieve.h"
 #include "cachelib/allocator/MMS3FIFO.h"
+#include "cachelib/allocator/MMS3FIFOForgive.h"
 
 namespace facebook {
 namespace cachelib {
@@ -36,7 +37,7 @@ const int MMSieve::kId = 6;
 // const int MMSieveBuffered::kId = 7;
 const int MMS3FIFO::kId = 5;
 const int MMLruForgive::kId = 8;
-// const int MMS3FIFOForgive::kId = 9;
+const int MMS3FIFOForgive::kId = 9;
 
 // AccessType
 const int ChainedHashTable::kId = 1;

@@ -327,8 +327,7 @@ class MMLruForgive {
         if (c < '0' || c > '9') break;
         value = value * 10 + static_cast<uint64_t>(c - '0');
       }
-      return static_cast<int>(
-          (value / 1'000'000'000ULL) % TARDISEmbeddingManager::kMaxThreads);
+      return static_cast<int>((value >> 32) % TARDISEmbeddingManager::kMaxThreads);
     }
 
     // recordAccess always runs on the thread that owns the accessed key (each

@@ -23,6 +23,7 @@
 #include "cachelib/allocator/MMClock.h"
 #include "cachelib/allocator/MMSieve.h"
 #include "cachelib/allocator/MMS3FIFO.h"
+#include "cachelib/allocator/MMS3FIFOForgive.h"
 #include "cachelib/common/Mutex.h"
 
 namespace facebook {
@@ -91,6 +92,12 @@ struct SieveCacheTrait {
 
 struct S3FIFOCacheTrait {
   using MMType = MMS3FIFO;
+  using AccessType = ChainedHashTable;
+  using AccessTypeLocks = SharedMutexBuckets;
+};
+
+struct S3FIFOForgiveCacheTrait {
+  using MMType = MMS3FIFOForgive;
   using AccessType = ChainedHashTable;
   using AccessTypeLocks = SharedMutexBuckets;
 };

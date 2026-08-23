@@ -15,6 +15,8 @@ using Cache = facebook::cachelib::SieveAllocator;
 using Cache = facebook::cachelib::SieveBufferedAllocator;
 #elif defined(USE_S3FIFO)
 using Cache = S3FIFOAllocator;
+#elif defined(USE_S3FIFOFORGIVE)
+using Cache = S3FIFOForgiveAllocator;
 #elif defined(USE_TWOQ)
 using Cache = Lru2QAllocator;
 #elif defined(USE_TINYLFU)

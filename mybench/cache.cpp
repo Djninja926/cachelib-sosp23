@@ -34,13 +34,11 @@ static void print_config(Cache::Config &config) {
 void mycache_init(int64_t cache_size_in_mb, unsigned int hashpower,
                        Cache **cache_p, PoolId *pool_p) {
   Cache::Config config;
-
   // auto rebalance_strategy = std::make_shared<HitsPerSlabStrategy>();
   // only works for LRU
   // auto rebalance_strategy = std::make_shared<LruTailAgeStrategy>();
   // only works for 2Q
   // auto rebalance_strategy = std::make_shared<MarginalHitsStrategy>();
-
   config.setCacheSize(cache_size_in_mb * 1024 * 1024)
       .setCacheName("My cache")
 #ifdef USE_STRICTLRU
@@ -49,10 +47,8 @@ void mycache_init(int64_t cache_size_in_mb, unsigned int hashpower,
       .setAccessConfig({hashpower, hashpower})
 #endif
       .validate();
-
   // print_config(config);
   *cache_p = new Cache(config);
-
 #if defined(USE_STRICTLRU)
   Cache::MMConfig mm_config;
   mm_config.lruRefreshTime = 0;
@@ -77,19 +73,34 @@ void mycache_init(int64_t cache_size_in_mb, unsigned int hashpower,
   *pool_p = (*cache_p)->addPool("default",
                                 (*cache_p)->getCacheMemoryStats().ramCacheSize,
                                 {}, mm_config);
+#elif defined(USE_S3FIFOFORGIVE)
+  Cache::MMConfig mm_config;
+  // MCACHE mode: bound the embedding store at 5x estimated cache item count,
+  // identical to USE_LRUFORGIVE so the two forgiveness policies are compared
+  // on the same embedding-store budget.
+  constexpr int64_t kAvgObjSize = 34000;
+  int64_t est_cache_items =
+      (cache_size_in_mb * 1024LL * 1024LL) / kAvgObjSize;
+  mm_config.maxEmbeddingEntries = 5 * est_cache_items;
+  fprintf(stderr,
+          "[S3FIFOFORGIVE] cache_mb=%ld, est_cache_items=%ld, "
+          "maxEmbeddingEntries=%ld (MCACHE 5x)\n",
+          (long)cache_size_in_mb,
+          (long)est_cache_items,
+          (long)mm_config.maxEmbeddingEntries);
+  *pool_p = (*cache_p)->addPool("default",
+                                (*cache_p)->getCacheMemoryStats().ramCacheSize,
+                                {}, mm_config);
 #else
   *pool_p = (*cache_p)->addPool("default",
                                 (*cache_p)->getCacheMemoryStats().ramCacheSize);
 #endif
-
-
   util::setCurrentTimeSec(1);
   assert(util::getCurrentTimeSec() == 1);
 }
 
 static inline std::string gen_key(struct request *req) {
   auto key = fmt::format_int(*(uint64_t *)(req->key)).str();
-
   return key;
 }
 
