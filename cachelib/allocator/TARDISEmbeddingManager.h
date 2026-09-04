@@ -148,23 +148,12 @@ class TARDISEmbeddingManager {
       s.recent_valid.resize(recent_window_, false);
     }
 
-    // Phase 1b recency-reorder knobs (read BEFORE any applier thread spawns).
-    if (const char* s = std::getenv("TARDIS_RECENCY_SHARDS")) {
-      recency_shards_ = std::atoi(s);
-      if (recency_shards_ < 1) recency_shards_ = 1;
-    }
-    if (const char* m = std::getenv("TARDIS_RECENCY_MODE")) {
-      recency_mode_ = std::atoi(m);
-    }
-    // Base core for pinning per-shard appliers: shard i pins to core
-    // applier_core_ + 2*i, so it doesn't float onto a core mybench has
-    // pinned a worker to (workers only ever use even cores, see
-    // mybench/benchMT.cpp) or migrate cross-NUMA away from its shard state.
-    // -1 disables pinning entirely.
-    if (const char* c = std::getenv("TARDIS_APPLIER_CORE")) {
-      applier_core_ = std::atoi(c);
-    }
-        if (const char* r = std::getenv("TARDIS_SAMPLE_RATE")) {
+    // Recency-reorder and applier-pinning knobs removed (dead experiments).
+    // Defaults stand: recency_shards_=1 (reorder OFF), recency_mode_=0,
+    // applier_core_=-1 (no pinning).
+
+
+    if (const char* r = std::getenv("TARDIS_SAMPLE_RATE")) {
       sample_rate_ = std::atof(r);
     }
     if (const char* m = std::getenv("TARDIS_SAMPLE_MODE")) {

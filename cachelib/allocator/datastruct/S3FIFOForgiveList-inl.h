@@ -56,8 +56,6 @@ T* S3FIFOForgiveList<T, HookPtr>::getEvictionCandidate() noexcept {
             // on its next lap to the small-FIFO tail (via the isAccessed branch).
             pfifo_->markAccessed(*curr);
             pfifo_->linkAtHead(*curr);
-          } else if (keepInSmall_) {
-            pfifo_->linkAtHead(*curr);
           } else {
             unmarkProbationary(*curr);
             markMain(*curr);

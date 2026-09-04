@@ -92,7 +92,6 @@ class S3FIFOForgiveList {
     forgiveThreshold_ = threshold;
     minAccessCount_ = minAccess;
     topK_ = topK;
-    if (const char* e = std::getenv("TARDIS_S3FF_KEEP_IN_SMALL")) keepInSmall_ = (std::atoi(e) != 0);
     if (const char* e = std::getenv("TARDIS_S3FF_MARK_ACCESSED")) markAccessed_ = (std::atoi(e) != 0);
   }
 
@@ -187,7 +186,6 @@ class S3FIFOForgiveList {
   folly::MPMCQueue<T*> evictCandidateQueue_{nMaxEvictionCandidates_};
   std::unique_ptr<std::thread> evThread_{nullptr};
   std::atomic<bool> stop_{false};
-  bool keepInSmall_ = false;   // TARDIS_S3FF_KEEP_IN_SMALL
   bool markAccessed_ = false;  // TARDIS_S3FF_MARK_ACCESSED: forgive by setting accessed bit + re-link in small (earns normal S3-FIFO promotion next lap)
 
   // Forgiveness state (non-owning manager + params).
